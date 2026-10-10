@@ -6,7 +6,7 @@ cdin is the editor — window, renderer, text pipeline, document, command and
 key registries — and it knows nothing about packages. This repository is
 everything the editor isn't.
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](LICENSE)
 
 ## Why it's a separate repository
 
@@ -196,4 +196,4 @@ No dependencies beyond that.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Mozilla Public License 2.0 — see [LICENSE](LICENSE). Third-party components retain their respective licenses; see [NOTICE](NOTICE).
