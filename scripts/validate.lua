@@ -15,6 +15,13 @@ local exists = scan.exists
 local errors = {}
 local warnings = {}
 local Schema  = dofile("cdinx/schema.lua")
+
+-- The one interpreter every shell-out in this file goes through, decided before
+-- either place that uses it: a local declared further down is a *global* to
+-- everything above it, and a nil global here put the literal text "nil" into a
+-- command line once already.
+local Select  = dofile("cdinx/manager/select.lua")
+local PYTHON  = os.getenv("CDIN_PYTHON") or Select.python_command()
 local root_files = {
   "README.md",
   "cdinx/init.lua",
@@ -29,6 +36,263 @@ local root_files = {
 }
 for _, path in ipairs(root_files) do
   if not exists(path) then errors[#errors+1] = path .. " not found" end
+end
+
+-- ── the workflow files ───────────────────────────────────────────────────
+--
+-- A workflow is only ever read by GitHub, so a mistake in one is invisible until
+-- a push -- at which point it costs a run, and the failure is a YAML load error
+-- that says nothing about which reference is wrong. Phase 9 deleted a job and
+-- left four references to it in ci.yml's `required` gate, which made the workflow
+-- fail to load before a single check ran. That is the shape of bug this rule is
+-- for: a workflow that cannot parse, or that refers to something not there.
+--
+-- It lives in validate rather than in ci.yml because `make validate` runs on a
+-- contributor's machine and in every build, and the mistake is one nobody
+-- catches by reading.
+--
+-- Deliberately not a YAML parser. These files are hand-written in one shape, and
+-- the facts that matter -- a job's `needs`, what a step reads out of `needs`, a
+-- job's `uses`, what it passes in `with:` -- are all recognisable line by line. A
+-- parser would be a dependency to answer a question patterns answer, and a
+-- dependency in `make validate` is a way for the gate itself to stop running.
+--
+-- What it does NOT check: indentation, quoting, matrices, action versions, or
+-- whether a `run:` block's shell is right. Those fail loudly and specifically in
+-- GitHub's parser. This asks only what a reader cannot answer by looking.
+
+-- Each line with its comments stripped, so a `# needs:` in a comment cannot
+-- register as a reference. Quoted `#` is not a comment in YAML; this
+-- repository writes none, and a wrong guess here only costs a pattern match.
+local function code_lines(text)
+  local out = {}
+  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+    out[#out + 1] = line:gsub("#.*$", "")
+  end
+  return out
+end
+
+-- The job names under `jobs:` in one file, and each job's own block.
+--
+-- A job name is a line indented by exactly two spaces whose value is empty --
+-- `  build:`. Anything deeper is a step or a key inside a job, and anything at
+-- zero indentation after `jobs:` has left the section. Depth is not tracked,
+-- because a job block in these files is either a reusable `uses:` or a `steps:`
+-- list, and both are indented past the name; the pattern for the name is what
+-- excludes them, not a brace count that would have to understand YAML to be
+-- right.
+local function jobs_of(text)
+  local jobs, order = {}, {}
+  local in_jobs = false
+  for _, bare in ipairs(code_lines(text)) do
+    if not in_jobs then
+      if bare:match("^jobs:%s*$") then in_jobs = true end
+    elseif bare:match("^%S") then
+      in_jobs = false                       -- a new top-level key ends the section
+    else
+      local name = bare:match("^  ([%w_%-]+):%s*$")
+      if name then
+        if not jobs[name] then order[#order + 1] = name end
+        jobs[name] = {}
+      else
+        local owner = order[#order]
+        if owner then
+          local body = jobs[owner]
+          body[#body + 1] = bare
+        end
+      end
+    end
+  end
+  return jobs, order
+end
+
+-- `needs: [a, b]` and `needs: a` both, because both spellings are in use here.
+-- Takes the job's block as the array of lines jobs_of built, not as text: the
+-- caller should not have to re-join it, and a joined copy would be a second
+-- representation to keep in agreement with the first.
+local function needs_list(block)
+  local list = {}
+  for _, line in ipairs(block) do
+    local rest = line:match("^%s*needs:%s*(.+)$")
+    if rest then
+      local inner = rest:match("^%[([^%]]*)%]")
+      if inner then
+        for name in inner:gmatch("[%w_%-]+") do list[#list + 1] = name end
+      else
+        local one = rest:match("^([%w_%-]+)%s*$")
+        if one then list[#list + 1] = one end
+      end
+      return list                        -- first `needs:` wins; there is only one
+    end
+  end
+  return list
+end
+
+-- Every workflow under .github/workflows, read into
+-- { name, text, lines, jobs, order } and keyed by its *name* -- "ci.yml", not a
+-- path.
+--
+-- Keyed by name on purpose. scan.list_files_recursive returns whatever prefix the
+-- platform's shell produced: absolute on Windows, relative in a POSIX tree, and
+-- spelled differently again under an emulation layer. Keying on that path meant
+-- every lookup of a file by its repo-relative name missed on Windows, so the rules
+-- that compare one workflow against another -- whether the callee exists, whether
+-- the callee declares an input -- silently did nothing there. The rules that report
+-- on the file they are currently reading passed regardless, which is what made this
+-- look like a working check.
+local function load_workflows()
+  local out = {}
+  if not exists(".github/workflows") then return out end
+  for _, path in ipairs(scan.list_files_recursive(".github/workflows")) do
+    local fh = io.open(path, "rb")
+    if fh then
+      local text = fh:read("*a")
+      fh:close()
+      -- The trailing path component, with either separator: the one thing that is
+      -- the same on every platform.
+      local name = path:gsub("\\", "/"):match("([^/]+)/*$")
+      local jobs, order = jobs_of(text)
+      out[name] = { name = name, text = text, lines = code_lines(text),
+                    jobs = jobs, order = order }
+    end
+  end
+  return out
+end
+
+do
+  local docs = load_workflows()
+
+  if not next(docs) then
+    errors[#errors+1] = ".github/workflows holds no workflow; a plugin repository " ..
+      "without CI cannot tell a user that cdin changed underneath it"
+  end
+
+  for _, name in ipairs((function()
+    local p = {}
+    for k in pairs(docs) do p[#p + 1] = k end
+    table.sort(p)
+    return p
+  end)()) do
+    local doc = docs[name]
+
+    -- A job that `needs:` one this file does not define. GitHub rejects the whole
+    -- workflow for this, not the one job: nothing in the file runs.
+    for _, job in ipairs(doc.order) do
+      for _, dep in ipairs(needs_list(doc.jobs[job])) do
+        if not doc.jobs[dep] then
+          errors[#errors+1] = string.format(
+            "%s: job %q needs %q, which is not a job in this file. GitHub rejects "
+            .. "the workflow outright rather than skipping the job, so nothing here "
+            .. "runs.", name, job, dep)
+        end
+      end
+    end
+
+    -- `needs.X.result` and `needs.X.outputs` read inside a step. Same
+    -- consequence, and the easiest reference in the file to leave behind: it
+    -- reads correctly right up until the job it names is renamed.
+    for _, bare in ipairs(doc.lines) do
+      for dep in bare:gmatch("needs%.([%w_%-]+)") do
+        if not doc.jobs[dep] then
+          errors[#errors+1] = string.format(
+            "%s: a step reads needs.%s, which is not a job in this file", name, dep)
+        end
+      end
+    end
+
+    -- A job that calls another workflow: the target must exist, and everything it
+    -- is passed must be an input the callee declares.
+    for _, job in ipairs(doc.order) do
+      local callee
+      for _, line in ipairs(doc.jobs[job]) do
+        callee = line:match("%./%.github/workflows/([%w_%-%.]+)")
+        if callee then break end
+      end
+      if callee then
+        local other = docs[callee]
+        if not other then
+          errors[#errors+1] = string.format(
+            "%s: job %q uses .github/workflows/%s, which does not exist",
+            name, job, callee)
+        else
+          -- The keys the caller passes. `with:` opens a block whose children are
+          -- the keys, and the flag is declared outside the loop -- inside it, the
+          -- flag is false on every line that could set it true, and the block is
+          -- never read at all.
+          local passed = {}
+          local in_with, with_indent = false, 0
+          for _, line in ipairs(doc.jobs[job]) do
+            if in_with then
+              -- A line at zero indentation, or at less than `with:`'s own, has
+              -- left the block.
+              if line:match("^%S") or #line:match("^%s*") <= with_indent then
+                in_with = false
+              else
+                local key = line:match("^%s+([%w_%-]+):")
+                if key then passed[key] = true end
+              end
+            elseif line:match("^%s*with:%s*$") then
+              in_with = true
+              with_indent = #line:match("^%s*")
+            end
+          end
+
+          -- The keys the callee declares, under `on: workflow_call: inputs:`.
+          -- Collected by indentation relative to the `inputs:` line rather than
+          -- scanned, because a scan of the whole file picks up every key in it and
+          -- then declares everything legal.
+          local declared = {}
+          local in_inputs, inputs_indent = false, nil
+          for _, line in ipairs(other.lines) do
+            if in_inputs then
+              local indent = #line:match("^%s*")
+              if line:match("^%S") or indent <= inputs_indent then
+                break
+              end
+              local key = line:match("^%s+([%w_%-]+):%s*$")
+              if key and indent == inputs_indent + 2 then declared[key] = true end
+            elseif line:match("^%s*inputs:%s*$") then
+              in_inputs, inputs_indent = true, #line:match("^%s*")
+            end
+          end
+
+          for key in pairs(passed) do
+            if not declared[key] then
+              errors[#errors+1] = string.format(
+                "%s: job %q passes with.%s to %s, which does not declare it as an "
+                .. "input", name, job, key, callee)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- ci.yml's `required` job is the gate a tag passes through. A job added above
+  -- and not listed there runs but cannot fail a release; a job listed there and
+  -- removed above is the load error checked already. The two lists have to agree,
+  -- and nothing else in the file notices when they do not.
+  local ci = docs["ci.yml"]
+  if ci and ci.jobs["required"] then
+    local gated = {}
+    for _, dep in ipairs(needs_list(ci.jobs["required"])) do gated[dep] = true end
+    for _, job in ipairs(ci.order) do
+      if job ~= "required" and not gated[job] then
+        errors[#errors+1] = string.format(
+          "ci.yml: job %q is not in the `required` gate's needs, so it cannot "
+          .. "fail a release. Add it there or say why it should not gate.", job)
+      end
+    end
+    -- And the reverse direction, which is the Phase 9 shape: the gate refers to a
+    -- job that is gone. Reported again, with the gate named, because "which list
+    -- is wrong" is the useful half of that message.
+    for _, dep in ipairs(needs_list(ci.jobs["required"])) do
+      if not ci.jobs[dep] then
+        errors[#errors+1] = "ci.yml: the `required` gate needs '" .. dep ..
+          "', which is not a job in this file"
+      end
+    end
+  end
 end
 
 -- ── fonts ────────────────────────────────────────────────────────────────
@@ -83,21 +347,108 @@ for _, theme in ipairs(themes) do
   end
 end
 
--- Nothing marks a package as mandatory: what a build carries is a bundle's
--- list and nothing else. A manifest that still carries the field is reading a
--- document that no longer exists, and the reader is the build.
-for _, entry in ipairs(scan.plugin_entries()) do
-  if entry.meta.essential ~= nil then
-    errors[#errors+1] = string.format(
-      "%s declares essential — no package does; name a bundle in bundles/ instead",
-      tostring(entry.meta.name))
+-- -- ── every removed package says where it went ────────────────────────────────
+--
+-- `cdinx/manager/moved.lua` is the only record of what twenty-odd packages
+-- became, and a record nobody checks is a record that drifts. The merge that
+-- moved them keeps its history; this table does not, and an entry pointing at a
+-- package that has since been renamed is advice worse than none.
+--
+-- So each owner must be a package this tree has, and each named feature must be
+-- one that owner declares. `entry.meta` is already the sandboxed manifest, read
+-- by the scan above, so this check reads no more code than that did.
+do
+  local Moved = dofile("cdinx/manager/moved.lua")
+
+  for _, old in ipairs(Moved.names()) do
+    local entry = Moved.lookup(old)
+    if not entry.owner or entry.owner == "" then
+      errors[#errors+1] = string.format("moved.lua: %s names no package it went to", old)
+    elseif not known[entry.owner] then
+      errors[#errors+1] = string.format(
+        "moved.lua: %s points at %q, which is not a package in this tree",
+        old, entry.owner)
+    elseif entry.feature then
+      local meta = known[entry.owner].meta
+      if not (meta.features and meta.features[entry.feature]) then
+        errors[#errors+1] = string.format(
+          "moved.lua: %s points at the %q feature of %q, which declares no such feature",
+          old, entry.feature, entry.owner)
+      end
+    end
+
+    if known[old] then
+      warnings[#warnings+1] = string.format(
+        "moved.lua still lists %q as removed, and it is a package in this tree", old)
+    end
   end
 end
-for _, theme in ipairs(themes) do
-  if theme.data.essential ~= nil then
-    errors[#errors+1] = string.format(
-      "theme %s declares essential — no theme does; name a bundle in bundles/ instead",
-      theme.name)
+
+-- ── the third-party index ────────────────────────────────────────────────
+--
+-- `registry/index.lua` is the file strangers install from, so every entry is
+-- checked the way the reader checks it at runtime: a valid name that no
+-- first-party package claims, a usable git URL, a 40-hex commit (never a tag --
+-- CI resolves the tag before the recipe lands), a subdir that stays inside the
+-- repository, a known kind. An empty index is valid: no vetted package is not
+-- an error, and the reader treats a missing file the same way.
+do
+  local path = "registry/index.lua"
+  local f = io.open(path, "rb")
+  if not f then
+    errors[#errors+1] = "registry/index.lua is missing; the file may be empty, but it must exist"
+  else
+    f:close()
+    -- The reader itself needs the host, so the gate reads through the sandbox
+    -- and checks with the same pure module the reader uses -- one implementation
+    -- of "what a recipe is", called from both sides rather than written twice.
+    local Recipe = dofile("cdinx/manager/recipe.lua")
+    local data, err = Schema.read_data(path, "index.lua")
+    local recipes, problems = {}, {}
+    if type(data) ~= "table" then
+      problems[#problems + 1] = "registry/index.lua is not readable: " .. tostring(err)
+    else
+      local taken = {}
+      for name in pairs(known) do taken[name] = true end
+      -- Themes are catalog names too: a recipe may not claim one either.
+      for _, theme in ipairs(scan.theme_entries()) do taken[theme.name] = true end
+      local seen = {}
+      local names = {}
+      for _, entry in ipairs(data) do names[#names + 1] = entry end
+      table.sort(names, function(a, b)
+        return tostring(a.name) < tostring(b.name)
+      end)
+      for _, entry in ipairs(names) do
+        if type(entry) ~= "table" then
+          problems[#problems + 1] = "registry/index.lua: an entry is not a table"
+        else
+          local problem = Recipe.check(entry, taken)
+          if problem then
+            problems[#problems + 1] = "registry/index.lua: " .. problem
+          elseif seen[entry.name] then
+            problems[#problems + 1] = string.format(
+              "registry/index.lua: %q is listed twice", entry.name)
+          else
+            seen[entry.name] = true
+            recipes[#recipes + 1] = entry
+          end
+        end
+      end
+    end
+    for _, problem in ipairs(problems) do
+      errors[#errors+1] = problem
+    end
+    -- The reader sorts; the file should already be sorted, so two checkouts
+    -- agree about more than the set.
+    local names = {}
+    for _, recipe in ipairs(recipes) do names[#names + 1] = recipe.name end
+    for i = 2, #names do
+      if names[i - 1] > names[i] then
+        errors[#errors+1] = "registry/index.lua is not sorted by name: "
+          .. tostring(names[i - 1]) .. " comes before " .. tostring(names[i])
+        break
+      end
+    end
   end
 end
 
@@ -211,6 +562,83 @@ local function files_under(dir)
     listing_cache[dir] = hit
   end
   return hit
+end
+-- ── the two selections agree ──────────────────────────────────────────────
+--
+-- cdinx/manager/select.lua and select_files in scripts/bundle.py are two
+-- implementations of one grammar, because the bundler cannot run Lua. Two
+-- implementations of anything drift, and this one drifts into a build that ships
+-- a file the editor would not have installed, or the reverse -- and neither is
+-- visible until a user reports a missing module.
+--
+-- So both run over every first-party package and the results are compared. The
+-- Python side is asked through `bundle.py --select`, which prints one relative
+-- path per line, so the comparison is on the same shape the Lua side produces.
+--
+do
+  -- Sizes are not compared: the Lua side is handed no sizes, because a selection is
+  -- about which files, not how big they are, and inventing a size here would be a
+  -- second source for a number the filesystem already has.
+  --
+  -- `PYTHON` is the file-scope local declared at the top: `python3` first and
+  -- `python` as the fallback, because a Windows Python installs itself as
+  -- `python.exe` and only sometimes also provides `python3`. A machine that has
+  -- Python and no `python3` on PATH otherwise made every package's cross-check fail
+  -- with a count mismatch -- the error says the *selections* disagree, when what
+  -- actually happened is that one side of the comparison was an
+  -- interpreter-not-found message counted as two filenames.
+  for _, entry in ipairs(scan.plugin_entries()) do
+    if entry.meta.name and not is_theme(entry) and not entry.single_file then
+      local base = entry.base
+
+      -- list_files_recursive strips the current directory, not the package, so the
+      -- package's own directory comes off before the paths mean anything to the
+      -- selector.
+      local prefix = base:gsub("\\", "/") .. "/"
+      local candidates = {}
+      for _, path in ipairs(files_under(base)) do
+        local rel = path:gsub("\\", "/")
+        if rel:sub(1, #prefix) == prefix then rel = rel:sub(#prefix + 1) end
+        candidates[#candidates + 1] = { path = rel, size = 0 }
+      end
+
+      local chosen, _, err = Select.pick(candidates)
+      if not chosen then
+        errors[#errors+1] = string.format(
+          "%s: the Lua selection refuses this package: %s", base, tostring(err))
+      else
+        local lua_names = {}
+        for _, item in ipairs(chosen) do lua_names[#lua_names + 1] = item.path end
+        table.sort(lua_names)
+
+        local pipe = io.popen(string.format(
+          '%s scripts/bundle.py --select "%s" 2>&1', PYTHON, base))
+        local out = pipe and pipe:read("*a") or ""
+        if pipe then pipe:close() end
+
+        local py = {}
+        for line in out:gmatch("[^\n]+") do
+          if line ~= "" then py[#py + 1] = line end
+        end
+        table.sort(py)
+
+        if #lua_names ~= #py then
+          errors[#errors+1] = string.format(
+            "%s: the Lua and Python selections disagree on how many files (%d vs %d)",
+            base, #lua_names, #py)
+        else
+          for i = 1, #lua_names do
+            if lua_names[i] ~= py[i] then
+              errors[#errors+1] = string.format(
+                "%s: the Lua and Python selections disagree: lua has %s where python "
+                .. "has %s", base, lua_names[i], py[i])
+              break
+            end
+          end
+        end
+      end
+    end
+  end
 end
 
 for name, entry in pairs(known) do
@@ -627,8 +1055,8 @@ local function seam_target(entry)
   -- package with a package.lua the name starts with the package's own name and
   -- the rest is a path inside it; for everything else the name is already a
   -- repo-relative path with dots turned into separators, because that is how
-  -- package.path is searched — `X.core.tab.impl` IS `X/core/tab/impl`, and
-  -- prefixing a root would make it `X/X/core/…`.
+  -- package.path is searched — `core.tab.impl` IS `core/tab/impl`, and
+  -- prefixing a root would make it `packages/X/core/…`.
   local rel
   if entry.package_file then
     local rest = mod:match("^" .. entry.meta.name .. "%.(.+)$")
@@ -825,7 +1253,9 @@ end
 -- came out against the exact file set the bundle's closure implies. A bundler
 -- that copies one file too many ships a build whose contents nobody chose, and
 -- one that copies one too few ships a build that loads and then does nothing.
-local PYTHON = os.getenv("CDIN_PYTHON") or "python3"
+-- The bundler's own invocation goes through the same interpreter the cross-check
+-- used, rather than looking one up again: two lookups of the same thing are two
+-- answers waiting to disagree, and this file already paid for the first one.
 local TMPDIR = os.getenv("TMPDIR") or os.getenv("TEMP") or os.getenv("TMP") or "."
 
 local function run_bundler(bundle, out)
@@ -855,9 +1285,18 @@ local function expected_files(bundle_name, with_fonts)
       -- themes/<name>, because that is where the host's theme registry looks.
       local leaf = entry.base:match("([^/\\]+)$") or ""
       local from = entry.base
+      -- A single-file package's leaf already carries the extension, because its
+      -- "directory name" *is* the filename. Dropping it here and re-adding it
+      -- below would produce `packages/c.lua.lua`.
+      if entry.single_file then leaf = leaf:gsub("%.lua$", "") end
+      -- Where a package's files land in a build. Flat, under its own name, so a
+      -- build carries a named set rather than a copy of the repository's tree --
+      -- which is also the shape Phase 7's installed store uses, so the kernel has
+      -- one rule for both. A standalone theme entry goes to themes/<name>, because
+      -- that is where the host's theme registry looks.
       local to = (entry.theme
         and ("themes/" .. leaf)
-        or ("X/" .. (entry.category or "core") .. "/" .. leaf))
+        or ("packages/" .. leaf .. (entry.single_file and ".lua" or "")))
 
       if entry.single_file then
         add(to)
@@ -887,7 +1326,11 @@ local function expected_files(bundle_name, with_fonts)
       end
 
       if not entry.theme then
-        add("plugins/" .. member .. ".lua")
+        -- No `plugins/<name>.lua` shim is expected here, and that is deliberate:
+        -- an entry in the host's bundled root loads unconditionally and cannot
+        -- be taken off, so one shim per package would make every bundled package
+        -- permanent. The absence is asserted in check_bundle's `absent` list
+        -- instead, so "there is no shim" is a gate rather than an oversight.
         for _, rel in ipairs(entry.meta.bundle_with or {}) do
           for _, f in ipairs(files_under(rel)) do add(f) end
         end
@@ -902,16 +1345,13 @@ local function expected_files(bundle_name, with_fonts)
   return expected
 end
 
--- The listing comes back with whatever prefix the platform produced — a
--- relative path for a tree inside the repo, an absolute one for a temp
--- directory, and a differently-spelled absolute one again under a POSIX
 -- The listing comes back with whatever prefix the platform produced — a relative
 -- path for a tree inside the repo, an absolute one for a temp directory, and a
 -- differently-spelled absolute one again under a POSIX emulation layer.
 --
 -- The relative part is recovered by cutting the known output directory, not by
--- looking for the last top-level entry: a package may now be *called* `themes`,
--- and a path like `X/core/themes/themes/nord/theme.lua` ends in four segments
+-- looking for the last top-level entry: a package may be *called* `themes`, and a
+-- path like `packages/system/themes/themes/nord/theme.lua` ends in four segments
 -- that all look like a top-level name. Guessing which one is real is a way to
 -- report a bundle as wrong when it is right.
 --- @param out string  the directory this check built the bundle in
@@ -935,12 +1375,40 @@ local function bundle_rel(out, path)
   return cut and p:sub(cut + 1) or p
 end
 
+--- Whether a bundle ships the fonts, read from the bundle file itself.
+---
+--- Read as text for the same reason bundle.py reads a manifest as text: a gate
+--- that executes a file to find out what it says has already done the thing it
+--- was written to check. The rule is bundle.py's rule exactly -- absent means the
+--- fonts go in, so only a stated `fonts = false` turns them off -- because two
+--- readers of one field with two rules is a build that is right in one tool and
+--- wrong in the other.
+---
+--- The previous signature took this as a fourth argument, defaulted from "did the
+--- caller pass an `absent` list", which made an unrelated argument decide whether
+--- fonts were expected. Passing `absent = { "packages/vim" }` silently turned the
+--- fonts off in the expectation while the bundler still copied them.
+--- @param bundle_name string
+--- @return boolean
+local function bundle_has_fonts(bundle_name)
+  local path = "bundles/" .. bundle_name .. ".lua"
+  if not exists(path) then return true end
+  local f = io.open(path, "rb")
+  if not f then return true end
+  local src = f:read("*a") or ""
+  f:close()
+  -- Comments are stripped first, so a bundle that explains `fonts = false` in a
+  -- comment is not read as having said it.
+  src = src:gsub("%-%-%[%[.-%]%]", " "):gsub("%-%-%[=*%[.-%]=*%]", " ")
+  src = src:gsub("%-%-[^\n]*", " ")
+  return src:match("fonts%s*=%s*false") == nil
+end
+
 --- @param bundle_name string
 --- @param required string[]  files that must be in the output
 --- @param absent string[]|nil  files that must not be
---- @param with_fonts boolean|nil  whether the closure implies `fonts/`
-local function check_bundle(bundle_name, required, absent, with_fonts)
-  if with_fonts == nil then with_fonts = (absent == nil) end
+local function check_bundle(bundle_name, required, absent)
+  local with_fonts = bundle_has_fonts(bundle_name)
   local out = TMPDIR .. "/cdin-x-validate-bundle-" .. bundle_name
   local output = run_bundler(bundle_name, out)
   if not output:find("bundled") and not output:find("✓") then
@@ -996,32 +1464,43 @@ local function check_bundle(bundle_name, required, absent, with_fonts)
   end
 end
 
--- `standard` is vim mode and the default theme. There is no `plugins/manager.lua`
--- and no manager package: every bundle writes the kernel and its shim, and the
--- shim is what the host loads, so the panel is reachable without any bundle
--- naming anything.
+-- `standard` is vim mode and the default theme.
+--
+-- There is no `plugins/vim.lua` any more, and that absence is the point of the
+-- layout rather than an omission: an entry in the host's bundled root loads
+-- unconditionally and cannot be taken off, so a shim per package would make
+-- every bundled package permanent. `vim` is a package under `packages/` and the
+-- kernel loads it, which is what lets a user turn it off. So the list below
+-- asserts `packages/vim/init.lua` *and* that `plugins/` holds nothing but the
+-- kernel shim.
 check_bundle("standard", {
   "BUNDLE.lua",
   "plugins/cdin-x.lua",
-  "plugins/vim.lua",
   "themes/default/theme.lua",
-  "X/core/vim/init.lua",
-  "X/core/vim/registry.lua",
-  "X/core/vim/ex/init.lua",
+  "packages/vim/init.lua",
+  "packages/vim/registry.lua",
+  "packages/vim/ex/init.lua",
   "cdinx/init.lua",
   "fonts/font.ttf",
   "fonts/monospace.ttf",
   "fonts/icons.ttf",
-}, { "plugins/manager.lua" }, true)
+  -- "X" rather than a path inside it: Phase 9 removed the directory, and the whole
+  -- of it is what must never come back. A filename under it would pass on a tree
+  -- that had quietly grown a different X/.
+}, { "plugins/manager.lua", "plugins/vim.lua", "plugins/themes.lua", "X" }, true)
 
--- `minimal` still has to produce a bootable kernel, and nothing else.
-check_bundle("minimal", { "BUNDLE.lua", "plugins/cdin-x.lua", "cdinx/init.lua" })
+-- `minimal` still has to produce a bootable kernel, and nothing else. It carries
+-- the fonts, because it does not say `fonts = false`.
+check_bundle("minimal", { "BUNDLE.lua", "plugins/cdin-x.lua", "cdinx/init.lua" },
+  { "packages/vim" })
 
 -- `empty` is the same, without the fonts: it is what a build names when it
 -- wants nothing from this repository, so it has to be an honest answer rather
--- than a default that quietly ships vim.
+-- than a default that quietly ships vim. The fonts are expected to be *absent*
+-- here because `bundles/empty.lua` says `fonts = false`, which is now read from
+-- that file rather than asserted by the caller.
 check_bundle("empty", { "BUNDLE.lua", "plugins/cdin-x.lua", "cdinx/init.lua" },
-  { "fonts/font.ttf" }, false)
+  { "fonts/font.ttf", "packages/vim" })
 
 -- cdin's assemble_data.py calls the bundler with --out and nothing else, so
 -- that call has to keep producing a usable editor. This is the check that
@@ -1034,7 +1513,10 @@ do
     errors[#errors+1] = "scripts/bundle.py with no --bundle must default to the " ..
       "standard bundle, because cdin's build calls it that way: " ..
       output:gsub("\n", " ")
-  elseif not exists(out .. "/plugins/vim.lua") then
+  elseif not exists(out .. "/packages/vim/init.lua") then
+    -- `packages/`, not `plugins/`: a build ships vim as an ordinary package the
+    -- kernel loads, so "did the default keep vim" is answered by asking whether
+    -- the package is there, not whether a shim was written for it.
     errors[#errors+1] = "scripts/bundle.py with no --bundle produced a bundle " ..
       "without vim; cdin's build would ship an editor with no vim mode"
   end
