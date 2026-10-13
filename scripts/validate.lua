@@ -295,6 +295,81 @@ do
   end
 end
 
+-- ── CI path filters ──────────────────────────────────────────────────────
+--
+-- A `paths:` entry in a workflow, or a `files:` entry in psx.yml, decides
+-- whether a change runs any check at all. An entry naming a file that does not
+-- exist cannot fail: it never matches, the workflow is already green for that
+-- path, and nothing says so.
+--
+-- This is the failure that survives every rule above. The workflow section
+-- proves a workflow's *internal* references resolve -- its jobs, its needs, its
+-- callees. A path filter is not an internal reference; it points at the working
+-- tree. Deleting the file it names removes the check that would have noticed
+-- the deletion, and the gate can no longer report on its own subject.
+--
+-- A glob is a pattern, not a path. `registry/**` is not a filename, and
+-- asserting on it as one reports a false failure on every run, so an entry
+-- carrying a wildcard is skipped rather than checked.
+--
+-- Deliberately not a YAML parser, for the reason at the top of the workflow
+-- section: a dependency in `make validate` is a way for the gate itself to stop
+-- running.
+do
+  -- Every file that carries path filters. psx.yml lists them under `files:`;
+  -- each workflow under .github/workflows lists them under `paths:`.
+  local filter_files = {}
+  if exists("psx.yml") then
+    filter_files[#filter_files + 1] = { name = "psx.yml", key = "files" }
+  end
+  for _, path in ipairs(scan.list_files_recursive(".github/workflows") or {}) do
+    -- The trailing component, not the path as the shell spelled it: that is
+    -- absolute on Windows and relative elsewhere, and the workflow section
+    -- above already records that depending on it made a lookup silently miss.
+    local name = path:gsub("\\", "/"):match("([^/]+)/*$")
+    filter_files[#filter_files + 1] = {
+      name = ".github/workflows/" .. name,
+      key = "paths",
+    }
+  end
+
+  for _, src in ipairs(filter_files) do
+    local fh = io.open(src.name, "rb")
+    if fh then
+      local text = fh:read("*a")
+      fh:close()
+      local checking = false
+      for _, line in ipairs(code_lines(text)) do
+        if line:match("^%s*" .. src.key .. ":%s*$") then
+          checking = true
+        elseif line:match("^%S") then
+          checking = false
+        end
+        if checking then
+          local p = line:match('^%s*%-%s*path:%s*"([^"]+)"')
+            or line:match("^%s*%-%s*path:%s*'([^']+)'")
+            or line:match('^%s*%-%s*"([^"]+)"')
+            or line:match("^%s*%-%s*'([^']+)'")
+          if p and not p:find("*", 1, true) and not p:find("?", 1, true) then
+            -- psx.yml writes a repository-absolute path and a workflow writes one
+            -- relative to the root. Both name the same file.
+            if not exists((p:gsub("^/", ""))) then
+              errors[#errors + 1] = string.format(
+                "%s: a CI path filter names %s, which does not exist. The filter "
+                  .. "can never match, so a change to that file runs nothing, and "
+                  .. "the check that would have noticed is the one that stopped "
+                  .. "running.",
+                src.name,
+                p
+              )
+            end
+          end
+        end
+      end
+    end
+  end
+end
+
 -- ── fonts ────────────────────────────────────────────────────────────────
 -- The bundled fonts are the ones this repository ships, and a cdin build
 -- cannot start without them. scripts/bundle.py refuses to substitute

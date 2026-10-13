@@ -206,7 +206,6 @@ custom:
     - path: "/scripts/bundle.py"
     - path: "/scripts/install.py"
     - path: "/scripts/plugin-list.lua"
-    - path: "/scripts/generate-manifest.lua"
     - path: "/scripts/generate-index.lua"
     - path: "/scripts/new-plugin.lua"
     - path: "/scripts/README.md"
