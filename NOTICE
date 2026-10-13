@@ -2,7 +2,11 @@ NOTICE
 ======
 
 cdin-x — Copyright (c) 2026 m-mdy-m
-Licensed under the MIT License. See LICENSE for details.
+Project license: Mozilla Public License 2.0 (MPL-2.0).
+See LICENSE for the full license text.
+
+The project license does not replace or remove the licenses of third-party
+components. Preserve their applicable notices when redistributing those parts.
 
 -------------------------------------------------------------------------------
 
@@ -10,13 +14,13 @@ This project contains extensions and runtime code for the cdin text editor.
 
 cdin — Copyright (c) 2026 m-mdy-m
 Source:  https://github.com/m-mdy-m/cdin
-License: MIT
+Project license: GNU General Public License v3.0 or later (GPL-3.0-or-later).
 
 This project is a fork of lite by rxi.
 
   lite — Copyright (c) 2020 rxi
   Source:  https://github.com/rxi/lite
-  License: MIT
+  Original license: MIT
 
   The original lite source provided the foundational editor loop, renderer
   pipeline, Lua embedding model, and core document/view architecture.
@@ -36,6 +40,6 @@ This project uses the following third-party libraries:
 
   stb_truetype — TrueType font rasterization
   Source:  https://github.com/nothings/stb
-  License: MIT
+  License: MIT / public-domain dedication, as stated by upstream.
 
 -------------------------------------------------------------------------------
