@@ -66,7 +66,7 @@ tell which was which.
 **A partner may carry a list of paths**, because two seams can wait on one package:
 
 ```lua
--- X/core/vim/package.lua
+-- packages/editing/vim/package.lua
 with = {
   git       = "with/git.lua",
   menu      = { "with/menus.lua", "with/plugin-manager.lua" },
@@ -173,7 +173,7 @@ one.
 So the collaborator is passed **in as an argument**:
 
 ```lua
--- X/core/vim/with/menus/menu.lua
+-- packages/editing/vim/with/menus/menu.lua
 function M.extend(registry, vim)     -- not require("menu.impl")
   ...
 end

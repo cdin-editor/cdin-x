@@ -176,12 +176,14 @@ otherwise.
 anything `if core.register_vcs_provider` exists. On a host without that hook it
 is a no-op with no message — the plugin looks loaded and does nothing.
 
-**There is no second hook any more.** The registry syncer that used to live
-here — `sync_registry`, which cloned and pulled the catalog — is gone. The
-extension catalog is not fetched with git: `cdinx` downloads
-`X/manifest.lua` and the files of the one extension being installed over plain
-HTTPS. `cdinx/manager/registry.lua` still accepts an injected syncer and prefers
-one if it is registered, but nothing in `X/` registers one.
+**The catalog is fetched with git.** `sync_registry`, which used to live here,
+is gone, along with the HTTPS download it wrapped: `cdinx/manager/registry.lua`
+keeps a **sparse shallow clone** of the cdin-x repository and reads the catalog
+out of it, while `cdinx/manager/git.lua` and `transport.lua` clone and update
+third-party packages the same way. Every git command runs as a detached job
+polled from a coroutine, so a slow or stalled transfer cannot freeze the editor.
+`Manager.set_registry_syncer` survives only as a deprecation shim that logs once
+per process, and nothing registers one.
 
 **Status polling is a coroutine.** It sleeps `config.git_update_rate` between
 passes and never blocks the frame loop. `is_ignored` is synchronous because the

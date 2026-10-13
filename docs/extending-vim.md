@@ -133,10 +133,10 @@ event is worth adding when the alternative is polling.
 
 ## A whole entry
 
-`X/core/vim/with/tab.lua` is about twenty lines and shows the shape:
+`packages/editing/vim/with/tab.lua` is about twenty lines and shows the shape:
 
 ```lua
--- X/core/vim/with/tab.lua
+-- packages/editing/vim/with/tab.lua
 local M = {}
 
 local commands = nil
@@ -185,13 +185,13 @@ be removed without leaving the other half-wired.
 
 | you want | read |
 | --- | --- |
-| ex-commands and `gt`/`gT` | `X/core/vim/with/tab.lua` |
-| <kbd>Ctrl</kbd>+<kbd>W</kbd> splits | `X/core/vim/with/window.lua` |
-| `/ n N *` over the search package | `X/core/vim/with/search.lua` |
-| the <kbd>m</kbd> menu | `X/core/vim/with/menus.lua` |
-| git commands, and a menu for them | `X/core/vim/with/git.lua` |
-| `:tree`, and the tree in vim | `X/core/vim/with/treeview.lua` |
-| the manager, from vim | `X/core/vim/with/plugin-manager.lua` |
+| ex-commands and `gt`/`gT` | `packages/editing/vim/with/tab.lua` |
+| <kbd>Ctrl</kbd>+<kbd>W</kbd> splits | `packages/editing/vim/with/window.lua` |
+| `/ n N *` over the search package | `packages/editing/vim/with/search.lua` |
+| the <kbd>m</kbd> menu | `packages/editing/vim/with/menus.lua` |
+| git commands, and a menu for them | `packages/editing/vim/with/git.lua` |
+| `:tree`, and the tree in vim | `packages/editing/vim/with/treeview.lua` |
+| the manager, from vim | `packages/editing/vim/with/plugin-manager.lua` |
 
 If you are adding a section to a menu another entry defines, read
 [building a with entry](building/a-with-entry.md) first. `menu.extend`

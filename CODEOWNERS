@@ -10,8 +10,6 @@ cdinx/              @m-mdy-m
 # First-party packages
 packages/           @m-mdy-m
 
-# What has not moved into packages/ yet: themes, syntax, the vim integrations
-X/                  @m-mdy-m
 
 # Scripts
 scripts/            @m-mdy-m

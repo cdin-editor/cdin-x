@@ -1,16 +1,31 @@
 # Adding a syntax definition
 
 ```text
-X/syntax/<language>.lua
+packages/languages/lang-<language>/{package.lua, init.lua, syntax.lua}
 ```
 
-One file per language, named for the language. No commands, no keys, and no
-dependency beyond the host — which is why it gets its own category instead of
-being a `core/` plugin: there is nothing to load and nothing to unload.
+One package per language, named `lang-<language>`. No commands, no keys, and no
+dependency beyond the host - which is why it gets its own category instead of
+being an ordinary plugin: there is nothing to load and nothing to unload.
 
-Six ship here: `c`, `javascript`, `lua`, `markdown`, `python`, `typescript` —
-and they claim disjoint extensions, so a `.ts` file is never picked up by the
-JavaScript definition. See the table below.
+A language package declares `kind = "lang"`, and the schema requires that name
+prefix: a name in the catalog should say what kind of thing it is before it is
+opened. `kind` marks the package for the panel and for `check.lua`'s R10; the
+definition itself is **not** manifest data. It is real Lua in `syntax.lua`,
+called through `core.syntax.add` from `init.lua`, because the reader must never
+execute a package to inspect it and the bundler reads manifests with a literal
+parser.
+
+Six ship here: `lang-c`, `lang-javascript`, `lang-lua`, `lang-markdown`,
+`lang-python`, `lang-typescript` - and they claim disjoint extensions, so a
+`.ts` file is never picked up by the JavaScript definition. See the table below.
+
+Three files per language is the shape:
+
+- `package.lua` - pure data: name, kind, version, description, the file
+  selection, and `entry`.
+- `syntax.lua` - the definition, a table the host understands.
+- `init.lua` - registers it once, and has nothing to undo.
 
 ## The fastest way
 
@@ -32,72 +47,76 @@ No manifest, no directory, no `make validate`. The host matches the active
 document's filename against `files` and uses the first definition that claims
 it, so order matters if you have several.
 
+This is for a definition only *you* want, in one editor, on one machine. It is
+not part of the catalog, cannot be installed by anyone else, and disappears when
+`core.syntax.add`'s list is reset - which cannot happen at runtime. For anything
+that should ship, use the package form above.
+
 ## To add it to the catalog
 
 ```sh
 lua scripts/new-plugin.lua zig syntax
-make manifest
+make index
 make validate
 ```
 
-That writes `X/syntax/zig.lua` from a template whose shape is copied from
-`X/syntax/lua.lua`, and it refuses to write anything if the file already exists.
-The refusal is the point: `new-plugin.lua lua syntax` in this repository would
-otherwise overwrite the real `X/syntax/lua.lua` without asking.
-
-Six ship here: `c`, `javascript`, `lua`, `markdown`, `python`, `typescript` —
-and they claim disjoint extensions, so a `.ts` file is never picked up by the
-JavaScript definition. See the table below.
+That writes `packages/languages/lang-zig/` - three files, the definition copied
+from `packages/languages/lang-lua/syntax.lua` - and it refuses to write anything
+if the directory already exists. The refusal is the point: `new-plugin.lua lua
+syntax` in this repository would otherwise overwrite the real
+`packages/languages/lua/` without asking.
 
 ## The shape
 
+`syntax.lua` is the definition, and it is the table the host understands:
+
 ```lua
 return {
-  name = "zig",
-  version = "0.1.0",
-  description = "Zig syntax support",
-  author = "cdin Team",
-  license = "MIT",
-  category = "syntax",
-  type = "plugin",
-  dependencies = {  },
-  min_cdin_version = "0.5.0",
-  tags = { "language", "zig" },
+  files   = "%.zig$",              -- which files this claims
+  headers = "^#!.*[ /]zig",        -- a shebang, for extensionless files
+  comment = "--",                  -- for commenting out a line
 
-  init = function(core, config)
-    require("core.syntax").add {
-      files   = "%.zig$",              -- which files this claims
-      headers = "^#!.*[ /]zig",        -- a shebang, for extensionless files
-      comment = "--",                  -- for commenting out a line
+  patterns = {
+    -- order matters: first match wins
+    { pattern = { '"', '"', '\\' }, type = "string" },
+    { pattern = "%-%-.*",           type = "comment" },
+    { pattern = "0x%x+",            type = "number" },
+    { pattern = "[%a_][%w_]*",     type = "symbol" },
+  },
 
-      patterns = {
-        -- order matters: first match wins
-        { pattern = { '"', '"', '\\' }, type = "string" },
-        { pattern = "%-%-.*",           type = "comment" },
-        { pattern = "0x%x+",            type = "number" },
-        { pattern = "[%a_][%w_]*",     type = "symbol" },
-      },
-
-      symbols = {                       -- a set keyed by word
-        ["fn"]    = "keyword",
-        ["const"] = "keyword",
-        ["true"]  = "literal",
-      },
-    }
-  end,
-
-  unload = function() end,
+  symbols = {                       -- a set keyed by word
+    ["fn"]    = "keyword",
+    ["const"] = "keyword",
+    ["true"]  = "literal",
+  },
 }
 ```
 
-**The manifest fields are at the top level and `init` does the work.** That is
-the single-file shape, and it is the only thing here that looks like the old
-style: a syntax definition has no directory, so there is no `package.lua` to put
-the manifest in, and it is the one place that keeps doing it the old way.
+`init.lua` registers it, and that is all it does:
 
-**`unload` is empty on purpose.** The highlighter has no remove, so there is
-nothing to undo. An empty function is a true statement about that; a missing one
-is a hole the reader has to reason about.
+```lua
+function M.init()
+  if M.registered then return end
+  M.registered = true
+  require("core.syntax").add(require("lang-zig.syntax"))
+end
+
+function M.unload()
+  M.registered = false
+end
+```
+
+**The module name carries the package name.** `require "lang-zig.syntax"` means
+package `lang-zig`, module `syntax`; the searcher resolves the first component to
+the package's own directory. A language package has no submodules, so this is the
+only require it makes.
+
+**`unload` cannot take the definition back.** The highlighter has no remove, so
+there is nothing to undo - and the package is no longer the same thing as the
+definition after the first `init`. Switching the package off stops it being
+loaded; it does not stop a `.zig` file being highlighted by the definition it
+already registered. An empty `unload` is a true statement about that; a missing
+one is a hole the reader has to reason about.
 
 ### `files` and `headers`
 
@@ -118,12 +137,12 @@ Six definitions ship, and they claim disjoint extensions:
 
 | definition | claims |
 | --- | --- |
-| `c` | `.c` `.h` `.inl` `.cpp` `.hpp` |
-| `javascript` | `.js` `.json` `.cson` |
-| `typescript` | `.ts` `.d.ts` `.tsx` |
-| `lua` | `.lua` |
-| `python` | `.py` |
-| `markdown` | `.md` `.markdown` |
+| `lang-c` | `.c` `.h` `.inl` `.cpp` `.hpp` |
+| `lang-javascript` | `.js` `.json` `.cson` |
+| `lang-typescript` | `.ts` `.d.ts` `.tsx` |
+| `lang-lua` | `.lua` |
+| `lang-python` | `.py` |
+| `lang-markdown` | `.md` `.markdown` |
 
 **`headers` is the same idea for files with no useful extension** — a
 shebang, matched against the first line, for a `#!/usr/bin/env python` script
@@ -231,6 +250,6 @@ is where you will find out.
 
 | file | holds |
 | --- | --- |
-| `X/syntax/<language>.lua` | the definition |
+| `packages/languages/lang-<language>/syntax.lua` | the definition |
 | `../../data/core/doc/highlighter.lua` | the walker, in the cdin repository |
 | `../../data/core/syntax.lua` | `syntax.add`, and the filename matching |

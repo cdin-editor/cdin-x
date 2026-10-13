@@ -26,7 +26,7 @@ the editor.
 
 ```sh
 lua scripts/new-plugin.lua my-theme themes
-make manifest
+make index
 make validate
 ```
 
@@ -42,8 +42,10 @@ Ten ship here: `catppuccin-mocha`, `default`, `dracula`, `github-light`,
 `tokyo-night`.
 
 **Nothing in a theme file says whether it ships.** A theme reaches a build only
-when a bundle in `bundles/` names it, and `standard` names `themes` — the
-*container*, not the themes inside it. See [X/README.md](../../X/README.md).
+when a bundle in `bundles/` names it, and `standard` names `themes` - the
+*container*, not the themes inside it. The domain bundles (`web-frontend`,
+`backend-python`, `devops-linux`) all name it too, because a theme is editor
+infrastructure rather than a capability of one kind of work.
 
 ## Every key
 
@@ -206,4 +208,4 @@ does not want a list.
 | --- | --- |
 | `theme.lua` | the colours, and nothing else |
 | `../../scripts/new-plugin.lua` | the template, copied from `nord` |
-| `../../scripts/generate-manifest.lua` | what puts it in the catalog index |
+| `../../scripts/generate-index.lua` | what puts it in the catalog index |

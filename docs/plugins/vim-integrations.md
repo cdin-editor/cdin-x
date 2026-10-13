@@ -6,7 +6,7 @@ part of `vim` rather than a separate installable — it exists only while both
 packages are loaded, and disappears when either one goes.
 
 ```lua
--- X/core/vim/package.lua
+-- packages/editing/vim/package.lua
 with = {
   git       = "with/git.lua",
   menu      = { "with/menus.lua", "with/plugin-manager.lua" },

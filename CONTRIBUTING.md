@@ -22,13 +22,13 @@ lua scripts/new-plugin.lua <name> syntax      # a language definition
 
 It refuses to write anything if the files already exist, which matters more than
 it sounds: `new-plugin.lua lua syntax` would otherwise overwrite the real
-`X/syntax/lua.lua`.
+`packages/languages/lua/`.
 
 The domain you pick is a decision, not a formality. `editing`, `navigation`,
 `system` and `vcs` are the four there are, and a package's `category` field is
-the domain — it is not a free-form label and it is not the package's own name.
-[`X/README.md`](X/README.md) is the one page that lays out where each kind of
-thing lives.
+the domain - it is not a free-form label and it is not the package's own name.
+The README of the domain directory you picked into is where that is written down
+for that domain.
 
 Then read [docs/writing-a-plugin.md](docs/writing-a-plugin.md), and copy
 whichever of the [examples/](examples/) is closest to what you want. The parts
@@ -80,7 +80,7 @@ the `remove`. One built fresh at removal time matches nothing, and it is silent.
    nobody asked for, and `validate` runs the real bundler for all three so that
    is a failure rather than a surprise.
 
-4. **Nothing under `cdinx/`, `X/` or `packages/` mentions `EXEDIR` or
+4. **Nothing under `cdinx/` or `packages/` mentions `EXEDIR` or
    `core.x`.** cdin-x does not know where the editor is installed, and there is
    no sibling checkout. `config.site_path()` is the whole of what it knows about
    paths, and it is the host's own resolver rather than one computed here.
@@ -130,18 +130,23 @@ If a package is generally useful, the user installs it.
 what cdin-x knows about where things are. No `EXEDIR`, no sibling checkout, no
 guessing where cdin was installed from. Validate will fail, and rightly.
 
-**Do not fetch at runtime.** The catalog is downloaded over HTTPS by
-`cdinx/manager/fetch.lua` and nothing shells out to git, because git may be
-absent and a bare editor must still boot. `Manager.set_registry_syncer` still
-exists and still has no callers; it is a seam a third-party package may fill, and
-it costs one comparison.
+**Transport is git, and it never blocks a frame.** The registry is a persistent
+sparse clone of this repository (`cdinx/manager/registry.lua`), and installing a
+third-party package clones its own repository (`cdinx/manager/git.lua`,
+`transport.lua`). Every git command is a detached job polled from a
+`core.add_thread` coroutine, so a slow network cannot freeze the editor. What
+git *cannot* do must still work: packages a build ships need no git at all, and
+`doctor` reports a missing one with one line on how to fix it.
+`Manager.set_registry_syncer` survives only as a deprecation shim that logs once;
+the HTTPS-download path it selected between is gone.
 
-**Do not reformat files you are not changing.** The tree is LF, with three
-deliberate exceptions: `X/manifest.lua`, which `scripts/generate-manifest.lua`
-writes with CRLF because it always has and changing that would churn every
-build; and `AGENTS.md` and `CODE_STYLE.md`, which have been CRLF since long
-before this file said anything about line endings. The fonts are binary, and
-binary is not text and is not a line ending at all.
+**Do not reformat files you are not changing.** The tree is LF, with five
+deliberate exceptions: `cdinx/manager/init.lua`, `cdinx/command.lua` and
+`scripts/validate.lua`, which are CRLF because of how they were written and
+re-wrapping them would churn every line; and `AGENTS.md` and `CODE_STYLE.md`,
+which have been CRLF since long before this file said anything about line
+endings. The fonts are binary, and binary is not text and is not a line ending
+at all.
 
 Nothing enforces this, which is worth knowing: the pre-commit hook runs
 `make validate` and nothing else, and `validate.lua` has no line-ending check.
@@ -162,7 +167,7 @@ own paragraph, it has usually discovered that the code needed a different shape.
 
 A file opens with a comment saying what it is and **what it refuses to do**. The
 conventions here are worth matching, and not only in the code: the next person
-deciding whether `X/core/vim` may require something else should find the answer
+deciding whether `packages/editing/vim` may require something else should find the answer
 at the top of the file.
 
 Keep functions short. A four-hundred-line function is a sign the file is doing
@@ -176,13 +181,13 @@ lua scripts/new-plugin.lua <name> themes
 
 `packages/system/themes/themes/<name>/theme.lua`, copied from `nord`'s key set.
 Nothing in a theme file decides whether it ships — a bundle names the `themes`
-package, not the themes inside it. Run `make manifest` afterwards; the catalog is
+package, not the themes inside it. Run `make index` afterwards; the catalog is
 generated.
 
 ## Before you open the pull request
 
 1. `make validate`
-2. `make manifest`, and commit `X/manifest.lua` if it changed
+2. `make index`, and commit `registry/generated/catalog.lua` if it changed
 3. `lua scripts/plugin-list.lua` — check the entry reads the way you meant
 4. A `README.md` for the package: what it is, what keys it takes, what it needs
    from the host. Two or three sentences is plenty; a directory README is an

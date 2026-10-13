@@ -43,6 +43,45 @@ Versioning follows [Semantic Versioning](https://semver.org/).
   `min_cdin_version` and nothing compared it. Install now refuses a package the running
   host cannot satisfy, saying what is needed and what this is.
 - **`scripts/check.lua`** — per-package rules, run by `make check`.
+- **Six language packages, and a third kind of bundle.** The syntax definitions are
+  packages now: `lang-c`, `lang-javascript`, `lang-lua`, `lang-markdown`,
+  `lang-python` and `lang-typescript`, each a `package.lua`, an `init.lua` and a
+  `syntax.lua`, declaring `kind = "lang"`. The `lang-` prefix is the schema's rule
+  (`cdinx/schema.lua` already required it and no package had ever tripped it), so a
+  name in the catalog now says what kind of thing it is. The definition is still
+  real Lua called through `core.syntax.add` - not manifest data - because a package
+  must never be executed to be inspected. Three **domain bundles** group packages for
+  a kind of work: `web-frontend`, `backend-python` and `devops-linux`, each carrying
+  `themes` because a theme is editor infrastructure rather than a capability of one
+  field of work. CSS, HTML, SQL, Bash, YAML, Rust and Go have **no** package; they are
+  listed under each bundle's `optional` so `make validate` reports them missing,
+  which records the gap rather than pretending to fill it.
+- **`make validate` checks the GitHub workflow files.** A job that `needs:` a job the
+  file does not define, a step reading `needs.X` for a job that was removed, a
+  reusable-workflow call that does not exist, a `with:` key the callee does not
+  declare, or a job the `required` gate does not list. Phase 9 deleted the `manifest`
+  job and left four references to it, which made the whole workflow fail to load
+  before a single check ran; nothing in the repository could see that.
+- **`make` works on Windows.** Interpreter discovery asks `where` there and
+  `command -v` on POSIX, `firstword` keeps `where python`'s three matches from
+  becoming one unrunnable command, the POSIX-shell guards moved into make's own
+  `$(error)`, and `make help` no longer prints a line of literal quote marks.
+  `make check` calls `check.lua` once with every package, so three packages report
+  three instead of three reports ending in "1 package(s)".
+- **`scripts/generate-index.lua` refuses to write an empty catalog.** A scanner that
+  finds nothing used to replace a real index with a stub that still parses. It now
+  fails with a message and leaves the committed file untouched.
+- **The language packages were renamed, and `lang-` is now required.** `c`,
+  `javascript`, `lua`, `markdown`, `python` and `typescript` are now `lang-c`,
+  `lang-javascript`, `lang-lua`, `lang-markdown`, `lang-python` and
+  `lang-typescript`, and each declares `kind = "lang"`. `cdinx/schema.lua` has
+  required the prefix since the schema landed; no package tripped it until now, so
+  the rule was never exercised. Two consequences: `require "lang-python.syntax"`
+  rather than `require "python.syntax"`, which is the only require any of them made,
+  and the panels that group by `category = "syntax"` still do, because `category`
+  is unchanged. **A user whose `packages.lua` or `disable` list names one of the old
+  names will find it retired** - `cdinx/manager/moved.lua` maps each old name to the
+  package it became and the panel says so by name.
 
 ### Changed
 
@@ -87,6 +126,17 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 - **The manager package.** What it bootstrapped is `cdinx/`, which every bundle now
   writes into the build along with its entry shim, so the panel is reachable without
   a package being responsible for it.
+- **`X/`** - the last of it. The directory held everything before `packages/`
+  existed, then vim, then only the generated manifest and the syntax definitions; the
+  language definitions are `lang-*` packages and the generated manifest is
+  `registry/generated/catalog.lua`. With it went `scripts/generate-manifest.lua`, the
+  `make manifest` target, and the CI job that existed only to check
+  `X/manifest.lua` was not stale. A build directory produced before this still has an
+  `X/` full of packages; `bundle.py` clears it, because a directory this script
+  copied into and does not clear is how a deleted file survives in every build after
+  it. Nothing scans `X/` any more, so that copy is inert either way.
+- **`Manager.set_registry_syncer`** as a working seam. It survives as a shim that
+  logs one deprecation per process, per the extension contract.
 
 ### Fixed (earlier, still unreleased)
 

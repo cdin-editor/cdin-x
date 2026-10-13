@@ -93,14 +93,19 @@ Six more live on the palette side, in `cdinx/command.lua`:
 | --- | --- |
 | a cdin build | the set the build ships, and nothing installable |
 | cdin-x installed into the site directory | the whole catalog, installable |
-| a catalog index on disk (`config.registry_dir`) | that index |
+| a registry clone on disk (`config.registry_dir`) | its index, `registry/generated/catalog.lua` |
 
-**The network, and how little of it.** Opening the panel the first time downloads
-one file, the index — `X/manifest.lua`, about 16 KiB. Search reads only that.
-Installing downloads only the files of the extension you picked; a theme is one
-`theme.lua`. Nothing is cloned, and git is not involved at any point.
-`registry.lua` will still use an injected syncer if something registers one, and
-nothing in this repository does.
+**The network, and how little of it.** The catalog is one generated file,
+`registry/generated/catalog.lua` (about 16 KiB), and search reads only that. It
+arrives as part of the registry, which is a **sparse git clone** of the cdin-x
+repository: a shallow, blobless clone of the index and nothing else, trimmed back
+to `registry/` after each install. Installing downloads only the selected files
+of the package you picked; a theme is one `theme.lua`. `git.lua` and
+`transport.lua` run every command as a detached job, so a slow network cannot
+block the frame, and `doctor` reports a missing `git` with one line on how to fix
+it. Packages a build ships need no git at all.
+`Manager.set_registry_syncer` survives only as a deprecation shim that logs once;
+the HTTPS-download path it used to choose between is gone.
 
 ## Config
 

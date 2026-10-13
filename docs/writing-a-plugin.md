@@ -212,14 +212,13 @@ and each is a rule rather than a label:
 
 | directory | holds |
 | --- | --- |
-| `packages/<category>/<name>/` | everything a bundle does not name |
-| `X/core/` | the mandatory set a bundle selects from |
-| `X/syntax/` | language definitions |
-| `<package>/themes/<name>/theme.lua` | themes, beside the package that ships them |
+| `packages/<domain>/<name>/` | everything, including the packages a bundle names |
+| `packages/languages/lang-<language>/` | language definitions, one package each |
+| `packages/system/themes/themes/<name>/theme.lua` | themes, beside the package that ships them |
 
-There is no `X/integration/` and no `X/optional/` any more. Wiring between two
-packages is a `with` entry *inside one of them*; everything else is in
-`packages/`, and a package's `category` field is the label.
+There is no `X/` any more, and with it no `X/integration/` and no `X/optional/`.
+Wiring between two packages is a `with` entry *inside one of them*; everything
+else is in `packages/`, and a package's `category` field is the label.
 
 The rule that makes the catalog checkable: **a package may not depend on another
 package.** Not may not *prefer* to — may not, at all.
@@ -321,11 +320,14 @@ until much later:
 - a feature or `with` file with no `enable`/`disable`, or a `features` key with
   no file at `features/<key>.lua`
 - a `register` without a matching `unregister`
-- an `EXEDIR` reference, or the old `core.x` namespace, anywhere in `cdinx/`,
-  `X/` or `packages/`
-- a keystroke no key press can produce — wrong modifier order, an uppercase key, a
+- an `EXEDIR` reference, or the old `core.x` namespace, anywhere in `cdinx/` or
+  `packages/`
+- a keystroke no key press can produce - wrong modifier order, an uppercase key, a
   `+` inside the key, or a modifier the input layer does not report
-- and finally it **runs the real bundler for each of the three bundles** and
+- a language package whose `kind` is not `lang`, or whose name is not `lang-*`
+- a workflow file whose `needs:`, `uses:` or `with:` names something that is not
+  there, or a job the `required` gate does not list
+- and finally it **runs the real bundler for every bundle** and
   compares, so the thing a cdin build consumes is checked rather than assumed
 
 ```sh

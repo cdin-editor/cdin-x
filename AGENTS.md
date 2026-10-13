@@ -65,8 +65,10 @@ make bundle [BUNDLE=<name>]    # no argument builds `standard`
 make list
 make check PKG=<path>          # one package against the rules in 6.9
 make index                     # writes registry/generated/catalog.lua
-make manifest                  # writes X/manifest.lua, until Phase 9 removes it
 ```
+
+`make manifest` is gone with `X/`. It regenerated a second copy of the catalog at
+`X/manifest.lua`; `registry/generated/catalog.lua` is the only generated index.
 
 No test target exists here. Do not add one.
 
