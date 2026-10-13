@@ -11,5 +11,12 @@ return {
   category = "core",
   min_cdin_version = "0.5.0",
 
+  -- Git status badges on the rows. Owned here rather than by `git` because this is
+  -- the package whose behaviour changes: with the entry up a row carries a git
+  -- letter, and with it down it does not.
+  with = {
+    git = "with/git.lua",
+  },
+
   entry = "init.lua",
 }

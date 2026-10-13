@@ -12,12 +12,5 @@ return {
   min_cdin_version = "0.5.0",
   needs = { executables = { "git" } },
 
-  -- Git status badges in the project file tree. Runs only while treeview is
-  -- loaded too, and this package being up is the other half of that condition --
-  -- see the file for why one key is enough.
-  with = {
-    treeview = "with/treeview.lua",
-  },
-
   entry = "init.lua",
 }

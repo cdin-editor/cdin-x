@@ -1,18 +1,18 @@
 -- Git status badges in the project file tree.
 --
--- The treeview package knows nothing about git: it exposes a generic provider
--- registry (badge + refresh, see treeview/api.lua) and this fills it in. Nothing
--- in treeview mentions git, and nothing else in git mentions treeview — which is
--- exactly why this is a `with` entry rather than a package or a dependency.
+-- `with` on `git`, owned by `treeview`. The owner is the package whose *behaviour*
+-- changes: installing this turns treeview rows from plain names into rows carrying
+-- a git letter, and uninstalling it takes those letters away again. Nothing in
+-- treeview mentions git and nothing in git mentions treeview — it is a generic
+-- provider registry in between, which is the whole reason a seam exists.
 --
--- `with` on `treeview`, declared by `git`. That single key is enough: the entry
--- is only ever offered while `git` itself is loaded, so `git` being up is implied
--- by the fact that we are running, and `treeview` is the only other party there
--- is to wait for. Two packages, one name in the table — which is the general
--- shape of the mechanism, not a special case of it.
+-- It was declared by `git` for a while, which works and is the wrong way round:
+-- the rule is that a `with` entry belongs to whoever is affected, so that turning
+-- that package off takes its seams with it for the right reason rather than by
+-- accident. See docs/building/a-with-entry.md.
 --
--- Everything is required inside `enable`, so a user without treeview never builds
--- any of it, and git's status thread does not start for them.
+-- Everything is required inside `enable`, so a user without git never builds any
+-- of this, and git's status thread does not start for them.
 local M = {}
 
 -- Single-letter git status -> badge glyph, and -> colour. Kept as data so
@@ -60,6 +60,8 @@ function M.enable()
   end, 100)
 
   treeview.register_refresh_provider(PROVIDER_ID, git.status.refresh)
+  -- register_vcs_provider is not callable from init(), so the status loop is
+  -- deferred; see the extension contract.
   core.add_thread(git.status.thread)
 end
 
