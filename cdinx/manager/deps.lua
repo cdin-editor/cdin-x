@@ -1,4 +1,5 @@
 local Catalog = require "cdinx.manager.catalog"
+local Version = require "cdinx.version"
 
 local Deps = {}
 
@@ -20,27 +21,95 @@ local function is_usable(ctx, name)
     or Catalog.is_installed(ctx, name)
 end
 
--- Orders `names` so every plugin comes after the plugins it depends on.
---
--- Returns `ordered, skipped`.
---
--- A plugin that cannot be loaded (a dependency is not installed, or there is
--- a cycle) is *skipped*, never fatal: it lands in `skipped[name]` as
---   { reason = "<text>", missing = { "<dep>", ... } }
--- and so does everything that depends on it. One extension with unmet
--- dependencies must not take the manager -- and with it every other
--- extension -- down. That is exactly what used to happen: installing
--- with/git.lua by itself made `topological_order` return nil for the WHOLE set,
--- bootstrap failed, and nothing at all was loaded.
---
--- `optional_dependencies` only influence ordering: if an optional dependency
--- is part of this load it goes first, if it is absent nothing happens.
+--- The range `plugin` asked for `dep`, or nil when it asked without one.
+---
+--- `depends` is a range map, so the names alone -- which is all
+--- `Schema.dependency_names` hands back -- cannot be checked against anything. The
+--- range is the promise, and dropping it is what made the field inert.
+local function wanted_range(plugin, dep)
+  local depends = plugin.spec and plugin.spec.depends
+  if type(depends) ~= "table" then return nil end
+  local range = depends[dep]
+  if type(range) ~= "string" or range == "" then return nil end
+  return range
+end
+
+--- Whether the available version of `dep` satisfies what `plugin` asked for.
+---
+--- Always a boolean. A range nobody can read is `true` with a reason, not nil:
+--- nil here would reach the caller's `not in_range` test and be treated as a
+--- failure, which is the one reading an unverifiable promise must never get.
+--- @param ctx table
+--- @param plugin table
+--- @param dep string
+--- @return boolean ok
+--- @return string|nil unreadable  set when the range could not be read at all
+local function range_ok(ctx, plugin, dep)
+  -- A dependency the host is running is not this kernel's to check. The host
+  -- does not report versions, and a range against something we cannot see would
+  -- refuse every package that names it.
+  if is_provided(ctx, dep) then return true end
+
+  local range = wanted_range(plugin, dep)
+  if not range then return true end
+
+  local entry = ctx.available[dep]
+  local version = entry and entry.version
+  if type(version) ~= "string" or version == "" then return true end
+
+  local ok, err = Version.satisfies(version, range)
+  if ok == nil then return true, err end
+  return ok, nil
+end--- Every name in the cycle that closes at `name`, sorted.
+---
+--- One name is not an answer: a user who sees "dependency cycle involving c" has
+--- to go and find which three packages are involved, and the walk that found it
+--- already knows. `order` is the visit stack, so the members are the tail from
+--- where `name` first appeared.
+local function cycle_members(order, name)
+  local first = 1
+  for i, entry in ipairs(order) do
+    if entry == name then first = i break end
+  end
+  local members = {}
+  for i = first, #order do members[#members + 1] = order[i] end
+  table.sort(members)
+  return members
+end
+
+--- Orders `names` so every plugin comes after the plugins it depends on.
+---
+--- Returns `ordered, skipped`.
+---
+--- A plugin that cannot be loaded (a dependency is not installed, the installed
+--- version is outside the range asked for, or there is a cycle) is *skipped*,
+--- never fatal: it lands in `skipped[name]` as
+---   { reason = "<text>", missing = { "<dep>", ... } }
+--- and so does everything that depends on it. One extension with unmet
+--- dependencies must not take the manager -- and with it every other
+--- extension -- down.
+---
+--- `optional_dependencies` only influence ordering: if an optional dependency
+--- is part of this load it goes first, if it is absent nothing happens.
+--- @param ctx table
+--- @param names string[]
+--- @return string[] ordered
+--- @return table<string, {reason: string, missing: string[]}> skipped
+--- @return string[] notes  things worth saying that are not failures
 function Deps.topological_order(ctx, names)
-  local ordered, skipped = {}, {}
+  local ordered, skipped, notes = {}, {}, {}
   local visiting, visited = {}, {}
+  local order = {}
+  local noted = {}
 
   local wanted = {}
   for _, name in ipairs(names) do wanted[name] = true end
+
+  local function note(text)
+    if noted[text] then return end
+    noted[text] = true
+    notes[#notes + 1] = text
+  end
 
   local function fail(name, reason, missing)
     skipped[name] = { reason = reason, missing = missing or {} }
@@ -56,7 +125,8 @@ function Deps.topological_order(ctx, names)
     if visited[name] then return true end
     if skipped[name] then return false, skipped[name].reason end
     if visiting[name] then
-      return false, "dependency cycle involving " .. name
+      local members = cycle_members(order, name)
+      return fail(name, "dependency cycle: " .. table.concat(members, " -> "), members)
     end
 
     local plugin = ctx.available[name]
@@ -65,13 +135,22 @@ function Deps.topological_order(ctx, names)
     end
 
     visiting[name] = true
+    order[#order + 1] = name
 
     -- Collect every problem instead of stopping at the first, so the user
     -- sees "needs git, menu, with/menus.lua" once, not three restarts' worth.
     local missing, blocked = {}, {}
     for _, dep in ipairs(plugin.dependencies or {}) do
+      local in_range, unreadable = range_ok(ctx, plugin, dep)
+      if unreadable then
+        note(string.format("%s declares depends.%s = %q, which cannot be checked",
+          name, dep, tostring(unreadable)))
+      end
       if not is_usable(ctx, dep) then
         missing[#missing + 1] = dep
+      elseif not in_range then
+        blocked[#blocked + 1] = Version.mismatch(dep, wanted_range(plugin, dep),
+          ctx.available[dep] and ctx.available[dep].version)
       else
         local ok, err = visit(dep)
         if not ok then
@@ -88,6 +167,7 @@ function Deps.topological_order(ctx, names)
       end
     end
 
+    order[#order] = nil
     visiting[name] = nil
 
     if #missing > 0 or #blocked > 0 then
@@ -109,7 +189,7 @@ function Deps.topological_order(ctx, names)
   for _, name in ipairs(names) do
     visit(name)
   end
-  return ordered, skipped
+  return ordered, skipped, notes
 end
 
 -- Exported so Runtime.load_plugin can skip a host-provided plugin reached

@@ -157,6 +157,27 @@ function M.toggle_feature()
   view:invalidate()
 end
 
+-- Installs without blocking: the staging is a background job chain, so the
+-- command returns as soon as it starts and the completion callback reports and
+-- redraws. A panel that froze while git worked would be the old `Fetch.download`
+-- wait in a new place.
+local function install_background(name)
+  local started, err = Manager.install_async(name, function(ok, result)
+    if not ok then
+      report(ok, result)
+    else
+      Host.core.log("extensions: installed %s", name)
+    end
+    if view then view:invalidate() end
+  end)
+  if not started then
+    report(started, err)
+    return
+  end
+  Host.core.log("extensions: installing %s in the background", name)
+  if view then view:invalidate() end
+end
+
 function M.toggle_cursor()
   local entry = current()
   if not entry then return end
@@ -165,19 +186,19 @@ function M.toggle_cursor()
     return
   end
 
-  local ok, err
   if entry.status == "installed" then
-    ok, err = Manager.disable(entry.name)
+    local ok, err = Manager.disable(entry.name)
     if ok then Host.core.log("extensions: disabled %s", entry.name) end
+    report(ok, err)
+    view:invalidate()
   elseif entry.status == "disabled" then
-    ok, err = Manager.enable(entry.name)
+    local ok, err = Manager.enable(entry.name)
     if ok then Host.core.log("extensions: enabled %s", entry.name) end
+    report(ok, err)
+    view:invalidate()
   else
-    ok, err = Manager.install(entry.name)
-    if ok then Host.core.log("extensions: installed %s", entry.name) end
+    install_background(entry.name)
   end
-  report(ok, err)
-  view:invalidate()
 end
 
 function M.install_cursor()
@@ -187,16 +208,15 @@ function M.install_cursor()
     Host.core.log("extensions: %s ships with the editor", entry.name)
     return
   end
-  local ok, err = Manager.install(entry.name)
-  view:invalidate()
-  if not ok then report(ok, err) return end
-  Host.core.log("extensions: installed %s", entry.name)
+  install_background(entry.name)
 end
 
 function M.uninstall_cursor()
   local entry = current()
   if not entry then return end
   if entry.locked then
+    -- Only `provided` reaches here now: a package the host loaded before cdin-x
+    -- ran, which the manager never loaded and so cannot undo.
     Host.core.log("extensions: %s is part of the editor and cannot be removed",
       entry.name)
     return
@@ -205,7 +225,16 @@ function M.uninstall_cursor()
     Host.core.log("extensions: %s is not installed", entry.name)
     return
   end
-  local ok, err = Manager.uninstall(entry.name)
+  -- A dev directory is asked about rather than removed: nothing of the user's is
+  -- deleted, and the only thing that can be undone here is forgetting the source,
+  -- which rewrites packages.lua and costs its comments. The question is asked
+  -- through the kernel's own menu so the answer is a keypress, and so the menu
+  -- vocabulary stays in one file instead of gaining a second list.
+  if entry.source == "dev" then
+    Command.show_forget(entry.name)
+    return
+  end
+  local ok, err = Manager.remove(entry.name, false)
   if not ok then report(ok, err) return end
   Host.core.log("extensions: removed %s", entry.name)
   view:invalidate()
@@ -241,6 +270,13 @@ function M.catalog_status()
     view.total, counts.editor or 0, counts.installed or 0, counts.available or 0)
   Host.core.log("  catalog   : %s (%s)", roots.registry_dir,
     roots.registry and "on disk" or "not downloaded")
+  -- The commit, not the branch: "which registry am I reading" wants the answer
+  -- that cannot move under the question. Asked here rather than on every draw,
+  -- because it spawns a process and a redraw is not the place for one.
+  local commit = Manager.registry_commit()
+  if commit then
+    Host.core.log("  commit    : %s", commit)
+  end
   Host.core.log("  download  : %s%s", state, message and (" - " .. message) or "")
   Host.core.log("  installed : %s", roots.installed and "present" or "nothing installed yet")
 end

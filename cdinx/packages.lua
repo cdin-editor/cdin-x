@@ -40,9 +40,12 @@ local Packages = {}
 -- The whole vocabulary of this file. Anything else is a typo, and a typo in a
 -- hand-edited settings file is worth naming rather than ignoring: the user reads
 -- "search = false" and gets no effect, which looks like a bug in the editor.
-local KNOWN_FIELDS = { packages = true, features = true }
+local KNOWN_FIELDS = { packages = true, features = true, sources = true }
 
 local cache = nil
+-- Bumped by anything that can change the answer: a write, and an invalidate.
+-- Declared next to the cache because it exists to say when that cache is stale.
+local generation = 0
 -- The config the file was read with, so the two accessors do not each have to be
 -- handed one. Set by `load`, and it is the only place a config is needed.
 local config_used = nil
@@ -50,7 +53,7 @@ local config_used = nil
 --- An empty choice: every package on, every feature at its declared default.
 --- @return table
 function Packages.empty()
-  return { packages = {}, features = {} }
+  return { packages = {}, features = {}, sources = {} }
 end
 
 --- Reads `<user_root>/packages.lua`, or an empty choice when there is none.
@@ -113,7 +116,7 @@ function Packages.load(config)
     end
   end
 
-  local data = { packages = {}, features = {} }
+  local data = { packages = {}, features = {}, sources = {} }
 
   -- `packages = { git = true, search = false }` -- a package on or off.
   for name, on in pairs(value.packages or {}) do
@@ -149,8 +152,53 @@ function Packages.load(config)
     end
   end
 
+  -- `sources = { ["name"] = "owner/repo" }` -- a third-party package, or a
+  -- working copy of one under development.
+  --
+  -- Kept exactly as written and never validated here: the shape of a source is
+  -- `Spec.parse`'s job, it needs the set of first-party names that only exists
+  -- once the catalog is scanned, and a file the editor writes back must round
+  -- trip its sources untouched. What is refused here is only a `sources` that
+  -- is not a table -- the one mistake that would make every later read of this
+  -- file fail for a reason the user could not act on.
+  if value.sources ~= nil and type(value.sources) ~= "table" then
+    problems[#problems + 1] = "packages.lua: sources must be a table of package "
+      .. "name to a repository or a directory"
+  else
+    data.sources = value.sources or {}
+  end
+
   cache = { data = data, problems = problems }
   return data, problems
+end
+
+--- The `sources` the user wrote, as written.
+---
+--- Not specs: `Spec.resolve` turns these into specs against the catalog, and
+--- `Packages.write` has to write back what it read. Keeping them in one shape
+--- from the file to the file is what stops the panel's first toggle from
+--- rewriting a third-party source into something it no longer means.
+--- @return table<string, any>
+function Packages.sources()
+  return Packages.load().sources or {}
+end
+
+--- Removes one source, so the next `write` no longer emits it.
+---
+--- How `Manager.remove` gives up ownership of a dev directory or a third-party
+--- source: the store copy goes, and the entry that told cdin-x about it goes
+--- with it, which is the only way a user gets back to "not installed" without
+--- editing the file by hand. The caller then writes the file -- which is what
+--- costs the user's comments, and what the panel says it costs.
+--- @param name string
+--- @return boolean removed
+function Packages.forget_source(name)
+  local data = Packages.load()
+  if type(data.sources) ~= "table" or data.sources[name] == nil then return false end
+  -- Mutated in place and the cache deliberately left alone: `write` reads the
+  -- cache, so invalidating here would re-read the file and throw the edit away.
+  data.sources[name] = nil
+  return true
 end
 
 --- Checks what the user wrote against the catalog that exists.
@@ -255,6 +303,26 @@ function Packages.audit(available)
     end
   end
 
+  -- A dev directory that is not there is the one source problem worth checking
+  -- here rather than at install time: nothing else will ever look at it again, and
+  -- the user's own `dir = "~/src/x"` is the path most likely to be stale -- the
+  -- repository moved, the machine was reinstalled. A git source is *not* checked:
+  -- it is not supposed to exist yet. Neither is a source whose name is in the
+  -- catalog, because claiming a name a build already ships is how a user replaces
+  -- what they were given, and that is a decision rather than a mistake.
+  local Spec = require "cdinx.manager.spec"
+  local sources = data.sources or {}
+  local names = {}
+  for name in pairs(sources) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local spec = Spec.parse(name, sources[name])
+    if spec and spec.kind == "dir" and not Host.fs.is_dir(spec.dir) then
+      problems[#problems + 1] = string.format(
+        "packages.lua: sources[%q] points at %s, which is not there", name, spec.dir)
+    end
+  end
+
   return problems
 end
 
@@ -265,6 +333,20 @@ end
 --- convenience.
 function Packages.invalidate()
   cache = nil
+  generation = generation + 1
+end
+
+--- How many times this file has been read or written.
+---
+--- Not a mtime and not a promise about the disk: a counter the module owns, bumped
+--- whenever the answer could have changed. Its only reader is the manager, which
+--- caches what it resolved *from* this file and must not keep that after the file
+--- moved underneath it. Passing the generation around instead of asking every
+--- caller to remember to invalidate is what makes the staleness impossible rather
+--- than merely unlikely.
+--- @return integer
+function Packages.generation()
+  return generation
 end
 
 --- The feature overrides for one package, or nil when the user said nothing.
@@ -293,6 +375,56 @@ function Packages.is_enabled(name)
   return data.packages[name] ~= false
 end
 
+--- Renders one source entry back to Lua source, or nil plus why not.
+---
+--- Written by hand rather than generically, because the vocabulary is fixed:
+-- `Spec.FIELDS` says what a source may contain, and a value outside it is
+--- reported rather than guessed at. A generic serializer would happily emit
+-- something the reader refuses, which is a worse failure than a refused write --
+--- it looks like it worked and the entry is gone next boot.
+---
+--- A string entry is written as a bare string (`"owner/repo"`), the shape a user
+--- would have written, rather than expanded into a table.
+--- @param entry any
+--- @return string|nil text
+--- @return string|nil err
+local function render_source(entry)
+  if type(entry) == "string" then
+    return string.format("%q", entry)
+  end
+  if type(entry) ~= "table" then
+    return nil, "a source is \"owner/repo\" or a table, got " .. type(entry)
+  end
+  -- A positional "owner/repo" is `{ "owner/repo", rev = ... }`, and is written
+  -- back in that shape so a user's shorthand survives a round trip.
+  local positional = nil
+  if entry[1] ~= nil then
+    if type(entry[1]) ~= "string" then
+      return nil, "a source's first value is \"owner/repo\", got " .. type(entry[1])
+    end
+    positional = entry[1]
+  end
+  local parts = {}
+  if positional then parts[#parts + 1] = string.format("%q", positional) end
+  for _, field in ipairs({ "git", "rev", "subdir", "dir", "name", "kind", "description" }) do
+    local value = entry[field]
+    if value ~= nil then
+      if type(value) ~= "string" then
+        return nil, string.format("sources.%s is a %s; only strings can be written back",
+          field, type(value))
+      end
+      parts[#parts + 1] = string.format("%s = %q", field, value)
+    end
+  end
+  if #parts == 0 then
+    return nil, "a source table says nothing about where the package is"
+  end
+  if #parts == 1 and positional and parts[1] == string.format("%q", positional) then
+    return parts[1]
+  end
+  return "{ " .. table.concat(parts, ", ") .. " }"
+end
+
 --- Writes the file back, atomically enough for a settings file.
 ---
 --- Comments are not preserved. A file the user edits by hand and the editor also
@@ -308,6 +440,22 @@ function Packages.write(config)
   local file = config.packages_file
   if not file then return false, "no packages_file" end
 
+  -- Rendered before anything is opened: a source that cannot be written back
+  -- must not cost the user the switches they were trying to change.
+  local source_lines, source_err = {}, nil
+  local source_names = {}
+  for name in pairs(data.sources or {}) do source_names[#source_names + 1] = name end
+  table.sort(source_names)
+  local rendered = {}
+  for _, name in ipairs(source_names) do
+    local text, err = render_source(data.sources[name])
+    if not text then
+      source_err = string.format("packages.lua: sources[%q]: %s", name, tostring(err))
+      break
+    end
+    rendered[#rendered + 1] = { name = name, text = text }
+  end
+
   Host.fs.mkdir(Util.parent_dir(file))
   local fp, err = io.open(file, "w")
   if not fp then return false, err end
@@ -315,6 +463,7 @@ function Packages.write(config)
   fp:write("-- Written by cdin-x. Editable; safe to keep.\n")
   fp:write("--\n--   packages = { <name> = false }   turn a whole package off\n")
   fp:write("--   features = { <pkg> = { <key> = false } }   turn one feature off\n")
+  fp:write("--   sources = { <name> = \"owner/repo\" }  a package of your own\n")
   fp:write("--\n-- Anything left out keeps the package's own default.\n")
   fp:write("return {\n")
 
@@ -343,9 +492,23 @@ function Packages.write(config)
     end
     fp:write("    },\n")
   end
-  fp:write("  },\n}\n")
+  fp:write("  },\n")
+
+  if not source_err then
+    if #rendered > 0 then
+      fp:write("  sources = {\n")
+      for _, entry in ipairs(rendered) do
+        fp:write("    [", string.format("%q", entry.name), "] = ", entry.text, ",\n")
+      end
+      fp:write("  },\n")
+    else
+      fp:write("  sources = {},\n")
+    end
+  end
+  fp:write("}\n")
   fp:close()
 
+  if source_err then return false, source_err end
   Packages.invalidate()
   return true
 end

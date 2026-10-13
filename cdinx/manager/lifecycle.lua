@@ -4,7 +4,7 @@ local Manifest = require "cdinx.manifest"
 local Util     = require "cdinx.manager.util"
 local Catalog  = require "cdinx.manager.catalog"
 local Runtime  = require "cdinx.manager.runtime"
-local Fetch    = require "cdinx.manager.fetch"
+local Moved    = require "cdinx.manager.moved"
 
 local Lifecycle = {}
 
@@ -84,7 +84,9 @@ local function is_disabled(ctx, name)
 end
 
 local function place(src, dst)
-  Fetch.mkdir_p(Host.fs.dirname(dst))
+  -- `fs.mkdir` makes every level, so there is no helper to call here: one call,
+  -- no wrapper, nothing to keep in step.
+  Host.fs.mkdir(Host.fs.dirname(dst))
   if Host.fs.exists(dst) then Host.fs.rm(dst) end
 
   local moved = Host.fs.move and Host.fs.move(src, dst)
@@ -98,37 +100,29 @@ local function place(src, dst)
   return true
 end
 
-local function fetch_entry(config, plugin)
-  local rel = plugin._relpath
-  if not rel then
-    return false, "the catalog index has no file list for " .. tostring(plugin.name)
-  end
-  local staged, err = Fetch.download(config.registry_dir, config.registry_raw_url,
-    plugin.name, plugin.files)
-  if not staged then return false, err end
+-- There is no `fetch_entry` any more, and deliberately so. Staging from the
+-- network is a transport operation -- a detached git job chain that never blocks
+-- the frame -- and a synchronous helper returning a staging directory cannot exist
+-- beside it without becoming the thing everyone calls by accident. Anything
+-- listed-but-not-materialised goes through `Manager.install_async`; the branch
+-- below that used to call the fetcher now refuses, and says where to go instead.
 
-  -- The staging directory keeps each package under the root it was listed at,
-  -- because that is how Fetch.download wrote it; the store is keyed by the path
-  -- below the root.
-  local root = plugin._source_root or "X"
-  local src = Util.join(staged, root, (rel:gsub("/", Host.sep)))
-  if plugin._single_file then src = src .. ".lua" end
-  if not Host.fs.exists(src) then
-    Fetch.discard(staged)
-    return false, "the download of " .. tostring(plugin.name) .. " was incomplete"
-  end
-  return src, staged
-end
-
+--- The dependencies a package declares, read without running it.
+---
+--- A directory is asked for its `package.lua`, which is data. A single file has
+--- no manifest that is not its own body, so there is nothing to read without
+--- running it — and this is called with `src` sometimes pointing into a download
+--- staging directory, where running it would mean running whatever a network
+--- handed back. So a single-file download contributes no declared dependencies,
+--- and `cdin-x:doctor` reports it as a shape that cannot be resolved from an
+--- index alone.
+--- @param plugin table
+--- @param src string|nil
+--- @return string[]
 local function declared_deps(plugin, src)
   if plugin.type == "theme" or not src then return {} end
-  local meta
-  if plugin._single_file then
-    local ok, m = pcall(dofile, src)
-    if ok and type(m) == "table" then meta = m end
-  else
-    meta = Manifest.load(src)
-  end
+  if plugin._single_file then return {} end
+  local meta = Manifest.load(src)
   return type(meta) == "table" and meta.dependencies or {}
 end
 
@@ -143,17 +137,29 @@ end
 function Lifecycle.install(ctx, config, name, ensure_registry, save_state, stack)
   local plugin = ctx.available[name]
   if not plugin then
-    local ok, err = ensure_registry(false)
+    local ok, err = ensure_registry()
     if not ok then return false, err end
     plugin = ctx.available[name]
   end
-  if not plugin then return false, "extension not found in catalog: " .. name end
+  if not plugin then
+    -- A name that used to be a package and is now part of one gets told where it
+    -- went, rather than a catalog line pointing at something that is not in it.
+    local advice = Moved.advice(name)
+    if advice then return false, advice end
+    return false, "extension not found in catalog: " .. name
+  end
 
   if plugin._source == "builtin" then
     return true, "already built-in"
   end
   if plugin._source == "provided" then
     return true, "provided by the editor"
+  end
+  -- A dev directory is already in place and is never copied. Reached only when a
+  -- caller bypasses the facade's routing; it answers with the truth rather than
+  -- copying a working copy into the store behind the user's back.
+  if plugin._source == "dev" then
+    return true, (plugin._spec and plugin._spec.dir) or "using your own copy"
   end
 
   -- Said before the dependency walk, so a package that cannot work here does not
@@ -197,11 +203,13 @@ function Lifecycle.install(ctx, config, name, ensure_registry, save_state, stack
     return true
   end
 
-  local src, staged = plugin._path, nil
+  -- Listed but not on disk: the network is the only way to get it, and the
+  -- network is asynchronous now. This synchronous entry point serves what is
+  -- already here; everything else goes through `Manager.install_async`.
   if plugin._listed and not plugin._materialised then
-    src, staged = fetch_entry(config, plugin)
-    if not src then return false, staged end
+    return false, name .. " is not on disk; install it from the Extensions panel"
   end
+  local src = plugin._path
 
   stack[name] = true
   for _, dep in ipairs(declared_deps(plugin, src)) do
@@ -211,7 +219,6 @@ function Lifecycle.install(ctx, config, name, ensure_registry, save_state, stack
       local ok, err = Lifecycle.install(ctx, config, dep, ensure_registry, save_state, stack)
       if not ok then
         stack[name] = nil
-        Fetch.discard(staged)
         return false, "dependency " .. dep .. ": " .. tostring(err)
       end
       Host.core.log("cdin-x: installed %s (required by %s)", dep, name)
@@ -221,7 +228,6 @@ function Lifecycle.install(ctx, config, name, ensure_registry, save_state, stack
 
   local dst = install_path_for(config, plugin)
   local ok, err = place(src, dst)
-  Fetch.discard(staged)
   if not ok then return false, err end
 
   ctx.state.disabled[name] = nil
@@ -237,11 +243,16 @@ end
 function Lifecycle.install_local(ctx, config, path, install_fn, save_state)
   path = Host.fs.abs(path)
 
-  local meta, err, single_file
+local meta, err, single_file
   if Host.fs.is_dir(path) then
     meta, err = Manifest.load(path)
     single_file = false
   elseif fs.is_file(path) and path:match("%.lua$") then
+    -- The one inspection-shaped dofile left in the kernel, and it is deliberate:
+    -- this is the user's own file, at a path they typed, and a single-file
+    -- package's manifest *is* its body. A directory above is read through the
+    -- sandbox like everything else, and nothing that came from a network gets
+    -- anywhere near here.
     local ok
     ok, meta = pcall(dofile, path)
     if not ok then meta, err = nil, tostring(meta) end
@@ -274,7 +285,7 @@ function Lifecycle.install_local(ctx, config, path, install_fn, save_state)
   end
 
   local dst = install_path_for(config, meta)
-  Fetch.mkdir_p(Host.fs.dirname(dst))
+  Host.fs.mkdir(Host.fs.dirname(dst))
   if Host.fs.exists(dst) then Host.fs.rm(dst) end
   local copied, copy_err = Host.fs.copy(path, dst)
   if not copied then return false, copy_err end
@@ -288,61 +299,12 @@ function Lifecycle.install_local(ctx, config, path, install_fn, save_state)
   return true, meta
 end
 
-function Lifecycle.update(ctx, config, name, registry_root)
-  local names
-  if name then
-    names = { name }
-  else
-    names = {}
-    for n, plugin in pairs(ctx.available) do
-      if plugin._source == "installed" then names[#names + 1] = n end
-    end
-    table.sort(names)
-  end
-
-  local updated, errors = {}, {}
-  local index = Catalog.scan_index(registry_root, "registry")
-  for _, n in ipairs(names) do
-    local installed_plugin = ctx.available[n]
-    if not installed_plugin or installed_plugin._source ~= "installed" then
-      errors[#errors + 1] = n .. ": not installed"
-    else
-      local locked = ctx.state.lock[n]
-      local registry_plugin = index[n]
-      if not registry_plugin then
-        -- Not in the registry (e.g. installed via install_local) — nothing to compare against.
-      elseif locked and locked.version == (registry_plugin.version or "") then
-        -- Already at the latest known version; nothing to do.
-      else
-        -- Download first: if it fails, the installed copy is untouched.
-        local src, staged = fetch_entry(config, registry_plugin)
-        if not src then
-          errors[#errors + 1] = n .. ": " .. tostring(staged)
-        else
-        local dst = install_path_for(config, installed_plugin)
-        local was_loaded = ctx.installed[n] ~= nil
-        if was_loaded then Runtime.unload_plugin(ctx, n) end
-        local copied, copy_err = place(src, dst)
-        Fetch.discard(staged)
-        if not copied then
-          errors[#errors + 1] = n .. ": " .. tostring(copy_err)
-        else
-          ctx.state.lock[n] = {
-            version = registry_plugin.version or "",
-            installed_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-          }
-          updated[#updated + 1] = n
-          if was_loaded and not is_disabled(ctx, n) then
-            Runtime.load_plugin(ctx, n)
-          end
-        end
-        end
-      end
-    end
-  end
-
-  return #errors == 0, { updated = updated, errors = errors }
-end
+-- Deleted: `Lifecycle.update`. Updating stages from the network, and the network
+-- is asynchronous now -- an `ls-remote` check, then a transport operation per
+-- package, all polled from the manager's thread. `Manager.update_async` owns that
+-- flow; a synchronous update beside it would either block the frame or lie about
+-- what "updated" means halfway through. The version comparison it did lives on
+-- in the update finalizer, against a fresh clone rather than a downloaded index.
 
 function Lifecycle.clean(ctx, user_extensions_root, registry_root, dry_run)
   local depended_on = {}
@@ -400,11 +362,29 @@ function Lifecycle.clean(ctx, user_extensions_root, registry_root, dry_run)
   return #errors == 0, { removed = removed, errors = errors }
 end
 
+--- Whether a package is present in this build and so can be switched off.
+---
+--- `builtin` used to mean "not switchable": the host loaded everything in its
+--- bundled root unconditionally and there was no way to ask it not to. That is no
+--- longer true -- a build ships its packages under `data/packages/`, which the
+--- host never looks at, and the kernel loads them like any other package. So a
+--- build-shipped package is an ordinary package with an ordinary state flag, and
+--- `vim` is the one this repository cares most about being able to turn off.
+---
+--- `provided` is the one source that is still not ours to switch: the host loaded
+--- that one before cdin-x ran, and the manager never did.
+--- @param plugin table|nil
+--- @return boolean
+local function is_present(plugin)
+  return plugin ~= nil
+    and (plugin._source == "builtin" or plugin._source == "installed")
+end
+
 function Lifecycle.enable(ctx, name, save_state)
   local plugin = ctx.available[name]
   if not plugin then return false, "unknown extension: " .. name end
-  if plugin._source == "builtin" then return true end
-  if plugin._source ~= "installed" then return false, "extension is not installed" end
+  if plugin._source == "provided" then return true end
+  if not is_present(plugin) then return false, "extension is not installed" end
 
   ctx.state.disabled[name] = nil
   save_state()
@@ -416,17 +396,15 @@ end
 function Lifecycle.disable(ctx, name, save_state)
   local plugin = ctx.available[name]
   if not plugin then return false, "unknown extension: " .. name end
-  -- "part of the editor" rather than "essential": the field is gone and the
-  -- panel already words it that way, so the message and the test now agree.
-  if plugin._source == "builtin" then
+  if plugin._source == "provided" then
     return false, plugin.name .. " is part of the editor and cannot be disabled"
   end
-  if plugin._source ~= "installed" then
+  if not is_present(plugin) then
     return false, "extension is not installed"
   end
 
   for other_name, other in pairs(ctx.available) do
-    if other_name ~= name and other._source == "installed" and not is_disabled(ctx, other_name) then
+    if other_name ~= name and is_present(other) and not is_disabled(ctx, other_name) then
       for _, dep in ipairs(other.dependencies or {}) do
         if dep == name then
           return false, "cannot disable " .. name .. ": required by " .. other_name
@@ -439,14 +417,23 @@ function Lifecycle.disable(ctx, name, save_state)
   if not ok then return false, err end
   ctx.state.disabled[name] = true
   save_state()
+  -- The unload re-pointed the searcher while this flag was still unset, so
+  -- without this the package the user just switched off keeps resolving until
+  -- something else happens to resync. See Runtime.resync.
+  Runtime.resync(ctx)
   return true
 end
 
 function Lifecycle.uninstall(ctx, name, save_state)
   local plugin = ctx.available[name]
   if not plugin then return false, "unknown extension: " .. name end
+  -- A build-shipped package can be switched off but not removed: its files are
+  -- in the build, and deleting them would mean editing an editor. The wording
+  -- says which of the two this is, because "part of the editor" was the message
+  -- for a package that could not be turned off either, and it is not any more.
   if plugin._source == "builtin" then
-    return false, plugin.name .. " is part of the editor and cannot be removed"
+    return false, plugin.name .. " ships with this build and cannot be removed -- "
+      .. "disable it instead"
   end
   if plugin._source ~= "installed" then
     return false, "extension is not installed: " .. name

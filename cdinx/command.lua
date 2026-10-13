@@ -2,6 +2,8 @@
 local Host    = require "cdinx.host"
 local command = require "core.input.command"
 local Manager = require "cdinx.manager"
+local Lock    = require "cdinx.manager.lock"
+local config  = require "cdinx.config"
 
 local Command = {}
 
@@ -46,7 +48,7 @@ local function open_items(title, items, submit)
 end
 
 local function catalog_items(include_builtins)
-  Manager.ensure_registry(false)
+  Manager.ensure_registry()
   Manager.scan()
 
   local items={}
@@ -98,6 +100,10 @@ function Command.show_menu()
     {text="Update All",info="Re-fetch installed extensions whose registry version changed",action=Command.show_update_all},
     {text="Clean",info="Remove installed extensions no longer in the registry",action=Command.show_clean},
     {text="Refresh Catalog",info="Update the cdin-x catalog",action=Command.show_refresh},
+    {text="Restore",info="Put every locked package back at the commit it was installed from",
+      action=Command.show_restore},
+    {text="Doctor",info="Say whether this installation is sound, and what to do if not",
+      action=Command.show_doctor},
     {text="Editor Log",info="Messages and errors from the editor and its extensions",
       action=function() command.perform("core:open-log") end},
   }
@@ -119,9 +125,12 @@ function Command.show_catalog()
     if st=="installed" or st=="disabled" then
       Command.show_details(plugin.name)
     else
-      local ok,err=Manager.install(plugin.name)
-      if ok then Host.core.log("Installed %s",plugin.name)
-      else Host.core.error("cdin-x: %s",err) end
+      local started,err=Manager.install_async(plugin.name,function(ok,result)
+        if ok then Host.core.log("Installed %s",plugin.name)
+        else Host.core.error("cdin-x: %s",tostring(result)) end
+      end)
+      if not started then Host.core.error("cdin-x: %s",tostring(err))
+      else Host.core.log("Installing %s in the background",plugin.name) end
     end
   end)
 end
@@ -139,6 +148,22 @@ function Command.show_details(name)
     end},
   }
 
+  -- The trust display: where this copy came from, which commit it is, and how
+  -- much of the disk it holds. Read-only -- the action only repeats it in full,
+  -- because a row in a menu truncates and a commit hash must not be truncated.
+  local lock=Manager.lock_info(name)
+  if lock and (lock.url or lock.rev) then
+    local short=(lock.url or "registry")
+    if lock.ref and lock.ref~="" then short=short.." @ "..lock.ref end
+    if lock.rev and lock.rev~="" then short=short.." "..lock.rev:sub(1,12) end
+    if lock.bytes then short=short.." · "..Manager.human_size(lock.bytes) end
+    items[#items+1]={text="Source",info=short,action=function()
+      Host.core.log("extensions: %s source=%s ref=%s rev=%s files=%s bytes=%s",name,
+        tostring(lock.url or "registry"),tostring(lock.ref or ""),
+        tostring(lock.rev or ""),tostring(lock.files or ""),tostring(lock.bytes or ""))
+    end}
+  end
+
   -- `or plugin.essential` was dead weight: no package may declare that field, so
   -- it was always false. `is_locked` is the whole test.
   if Manager.is_locked(name) then
@@ -155,21 +180,32 @@ function Command.show_details(name)
       end}
     items[#items+1]={text="Update",info="Re-fetch from the registry if a newer version exists",
       action=function()
-        local ok,result=Manager.update(name)
-        if ok and #result.updated>0 then Host.core.log("Updated %s",name)
-        elseif ok then Host.core.log("%s is already up to date",name)
-        else Host.core.error("cdin-x: %s",result.errors and table.concat(result.errors,"; ") or "update failed") end
+        local started,err=Manager.update_async(name,function(ok,result)
+          if ok and result.updated and #result.updated>0 then Host.core.log("Updated %s",name)
+          elseif ok then Host.core.log("%s is already up to date",name)
+          else Host.core.error("cdin-x: %s",result.errors and table.concat(result.errors,"; ") or tostring(result)) end
+        end)
+        if not started then Host.core.error("cdin-x: %s",tostring(err))
+        else Host.core.log("Updating %s in the background",name) end
       end}
+    -- A build-shipped package can be updated like any installed one; it cannot
+    -- be uninstalled, and `Manager.uninstall` is the one that says so.
     items[#items+1]={text="Uninstall",info="Remove the installed extension",
       action=function()
         local ok,err=Manager.uninstall(name)
         if not ok then Host.core.error("cdin-x: %s",err) else Host.core.log("Uninstalled %s",name) end
       end}
   else
-    items[#items+1]={text="Install",info="Copy into the local extension store",
+    -- Show where it comes from while it is still only an idea: the URL, the ref
+    -- and the commit are the trust display, and the panel is where a source that
+    -- is neither first-party nor indexed gets its confirmation.
+    items[#items+1]={text="Install",info="Fetch with git and install the selected files",
       action=function()
-        local ok,err=Manager.install(name)
-        if not ok then Host.core.error("cdin-x: %s",err) else Host.core.log("Installed %s",name) end
+        local started,err=Manager.install_async(name,function(ok,result)
+          if not ok then Host.core.error("cdin-x: %s",tostring(result)) else Host.core.log("Installed %s",name) end
+        end)
+        if not started then Host.core.error("cdin-x: %s",tostring(err))
+        else Host.core.log("Installing %s in the background",name) end
       end}
   end
 
@@ -222,14 +258,27 @@ function Command.show_install_local()
 end
 
 function Command.show_update_all()
-  local ok,result=Manager.update()
-  if #result.updated>0 then
-    Host.core.log("cdin-x: updated %s",table.concat(result.updated,", "))
+  -- Background, like every install: the check is one `ls-remote` per package and
+  -- the staging is a clone per package, and neither happens on the frame thread.
+  local started,err=Manager.update_async(nil,function(ok,result)
+    if not ok and type(result)=="string" then
+      Host.core.error("cdin-x: %s",result)
+      return
+    end
+    result=result or {updated={},errors={}}
+    if #result.updated>0 then
+      Host.core.log("cdin-x: updated %s",table.concat(result.updated,", "))
+    else
+      Host.core.log("cdin-x: everything installed is already up to date")
+    end
+    if not ok then
+      Host.core.error("cdin-x: %s",table.concat(result.errors,"; "))
+    end
+  end)
+  if not started then
+    Host.core.error("cdin-x: %s",tostring(err))
   else
-    Host.core.log("cdin-x: everything installed is already up to date")
-  end
-  if not ok then
-    Host.core.error("cdin-x: %s",table.concat(result.errors,"; "))
+    Host.core.log("cdin-x: checking for updates in the background")
   end
 end
 
@@ -256,24 +305,164 @@ function Command.show_clean()
 end
 
 function Command.show_refresh()
-  local ok,err=Manager.refresh_registry()
-  if ok then
-    Host.core.log("cdin-x catalog refreshed")
-    Command.show_catalog()
+  -- Background like every other network operation: refreshing moves the registry
+  -- clone, and the catalog is re-read when it lands.
+  local started,err=Manager.refresh_registry(function(ok,rev)
+    if ok then
+      Host.core.log("cdin-x catalog refreshed")
+      Command.show_catalog()
+    else
+      Host.core.error("cdin-x: %s",tostring(rev))
+    end
+  end)
+  if not started then
+    Host.core.error("cdin-x: %s",tostring(err))
   else
-    Host.core.error("cdin-x: %s",err)
+    Host.core.log("cdin-x: refreshing the catalog in the background")
   end
 end
 
-function Command.register()
-  command.add(nil,{
-    ["cdin-x:menu"]=Command.show_menu,
-    ["pluginmanager:menu"]=Command.show_menu,
-    ["cdin-x:catalog"]=Command.show_catalog,
-    ["cdin-x:update"]=Command.show_update_all,
-    ["cdin-x:clean"]=Command.show_clean,
-    ["cdin-x:refresh"]=Command.show_refresh,
-  })
+--- Asks before forgetting a dev directory.
+---
+--- The panel's remove key reaches here for a package that is the user's own working
+--- copy, because the two things "remove" could mean are not the same and only one
+--- of them is reversible: forgetting the source rewrites `packages.lua` and costs
+--- its comments, and deleting the directory is not cdin-x's to do. So it is
+--- offered as a menu item that says both, rather than a flag nobody reads.
+--- @param name string
+function Command.show_forget(name)
+  local plugin = Manager.get(name)
+  local dir = (plugin and plugin._spec and plugin._spec.dir) or "a directory of yours"
+  local items = {
+    {
+      text = string.format("Forget %s and stop using %s", name, dir),
+      info = string.format(
+        "packages.lua is rewritten, so its comments are lost. Nothing in %s is deleted.",
+        dir),
+      action = function()
+        local ok, err = Manager.remove(name, true)
+        if not ok then Host.core.error("cdin-x: %s", tostring(err)) return end
+        Host.core.log("cdin-x: no longer using %s; %s is untouched", name, dir)
+        Command.show_installed()
+      end,
+    },
+    { text = "Cancel", info = "", action = function() end },
+  }
+  open_items("Remove " .. name, items, function(_, item)
+    if item and item.action then item.action() end
+  end)
 end
+
+--- Says whether this installation is sound, and what to do about it if not.
+---
+--- Printed to the log rather than opened as a menu, because the answer is read
+--- once and then acted on: a menu of checks is a menu to dismiss, and a block of
+--- lines in the log is something to copy a line of into a fix. The same report is
+--- what `cdin-x doctor` prints, so a bug report can quote either.
+function Command.show_doctor()
+  local Doctor = require "cdinx.manager.doctor"
+  local checks = Manager.doctor()
+  for _, line in ipairs(Doctor.lines(checks)) do
+    Host.core.log("%s", line)
+  end
+  if Doctor.failed(checks) then
+    Host.core.error("cdin-x: something above will not work; each line says what to do")
+  else
+    Host.core.log("cdin-x: nothing above is broken")
+  end
+end
+
+--- Puts every locked package back at the commit `cdin-x.lock` names.
+---
+--- Async like every other network operation, and offered as a menu item rather
+--- than fired straight away: a restore overwrites the store for every third-party
+--- package at once, and the one question worth asking first is how many there are.
+function Command.show_restore()
+  local data, problems = Lock.load(config)
+  if not data then
+    Host.core.error("cdin-x: cdin-x.lock is not readable: %s", tostring(problems[1]))
+    return
+  end
+  local names = {}
+  for name, entry in pairs(data.packages) do
+    -- A dev directory has nothing to restore, so listing it would be asking the
+    -- user to confirm work that cannot happen.
+    if entry.source ~= "dir" then names[#names + 1] = name end
+  end
+  table.sort(names)
+
+  if #names == 0 then
+    Host.core.log("cdin-x: nothing to restore -- cdin-x.lock lists no installed package")
+    return
+  end
+
+  local items = {}
+  items[#items + 1] = {
+    text = string.format("Restore %d package(s) at their locked commits", #names),
+    info = table.concat(names, ", "),
+    action = function() Command.run_restore() end,
+  }
+  items[#items + 1] = {
+    text = "Cancel", info = "", action = function() Host.core.log("cdin-x: restore cancelled") end,
+  }
+  open_items("Restore CDIN-X", items, function(text, item)
+    if item and item.action then item.action() end
+  end)
+end
+
+function Command.run_restore()
+  local started, err = Manager.restore_async(nil, function(ok, result)
+    for _, line in ipairs(result.restored or {}) do
+      Host.core.log("cdin-x: restored %s", line)
+    end
+    for _, line in ipairs(result.skipped or {}) do
+      Host.core.log("cdin-x: skipped %s", line)
+    end
+    for _, line in ipairs(result.errors or {}) do
+      Host.core.error("cdin-x: %s", line)
+    end
+    if ok and #(result.restored or {}) == 0 and #(result.errors or {}) == 0 then
+      Host.core.log("cdin-x: everything was already where it should be")
+    end
+  end)
+  if not started then
+    Host.core.error("cdin-x: %s", tostring(err))
+  else
+    Host.core.log("cdin-x: restoring in the background...")
+  end
+end
+
+-- The kernel's own commands, and the name list that takes them back.
+--
+-- Both derived from one table, because a hand-written second list drifts: this
+-- repository already shipped `pluginmanager:menu` registered nowhere. Iterating
+-- the map cannot be wrong in that direction, and the loop is the whole point.
+--
+-- The host's `command.remove` takes names, not the table it was given, so the
+-- list is built here rather than being a table field somebody has to maintain.
+local COMMANDS = {
+  ["cdin-x:menu"]       = Command.show_menu,
+  ["pluginmanager:menu"] = Command.show_menu,
+  ["cdin-x:catalog"]    = Command.show_catalog,
+  ["cdin-x:update"]     = Command.show_update_all,
+  ["cdin-x:clean"]      = Command.show_clean,
+  ["cdin-x:refresh"]    = Command.show_refresh,
+  ["cdin-x:restore"]    = Command.show_restore,
+  ["cdin-x:doctor"]     = Command.show_doctor,
+}
+
+local NAMES = {}
+for name in pairs(COMMANDS) do NAMES[#NAMES + 1] = name end
+table.sort(NAMES)
+
+function Command.register()
+  command.add(nil, COMMANDS)
+end
+
+function Command.unregister()
+  command.remove(NAMES)
+end
+
+Command.names = NAMES
 
 return Command

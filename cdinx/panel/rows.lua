@@ -59,10 +59,15 @@ end
 -- query:  the filter, "" for none.
 -- notice: an optional line about where extensions would come from, shown at
 --         the end of the list when the panel has nothing installable to offer.
+-- store_total: an optional human size for the Installed section ("412 KiB"), or
+--         nil. It arrives separately because it is a property of the store, not
+--         of any entry, and summing it here would mean trusting every entry to
+--         carry one. Named in full because `total` below already means the entry
+--         count, and two totals in one function is how the wrong one gets read.
 --
 -- Returns { rows, counts, matched, total, query }. A row is
 --   { kind = "section" | "category" | "entry" | "empty" | "notice", ... }
-function Rows.build(entries, query, notice)
+function Rows.build(entries, query, notice, store_total)
   query = Search.normalize(query)
 
   local buckets = { editor = {}, installed = {}, available = {} }
@@ -144,7 +149,13 @@ function Rows.build(entries, query, notice)
   end
 
   add_section("editor", "In the editor", false)
-  add_section("installed", "Installed", true)
+  -- The total is the section's answer to "how much": per-package sizes live on
+  -- the rows, and this is the number they add up to.
+  local installed_label = "Installed"
+  if store_total and store_total ~= "" and store_total ~= "0 B" then
+    installed_label = "Installed (" .. store_total .. ")"
+  end
+  add_section("installed", installed_label, true)
   add_section("available", "Available", true)
 
   if #rows == 0 then

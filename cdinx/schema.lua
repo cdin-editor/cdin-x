@@ -425,6 +425,30 @@ function Schema.read(path)
   return value
 end
 
+--- Reads one file of Lua data and returns whatever it produced, unvalidated.
+---
+--- The same sandbox as `read`, without the package schema. Two callers need
+--- exactly that: a `theme.lua`, which is a table of colours and nothing else, and
+--- a registry's catalog index, which is a map of maps. Neither is a package, and
+--- validating either as one would demand a name, a version and a description from
+--- a file that has none of those and should not.
+---
+--- Nothing here validates, so the caller must: this reads, the caller decides.
+--- @param path string  the file to read
+--- @param label string|nil  what to call the file in an error message
+--- @return table|nil value
+--- @return string|nil err
+function Schema.read_data(path, label)
+  local text, rerr = read_source(path)
+  if not text then return nil, rerr end
+
+  local value, eerr = run_sandboxed(text, "=" .. (label or path))
+  if value == nil and eerr then return nil, eerr end
+  if type(value) ~= "table" then
+    return nil, string.format("%s must return a table, got %s", path, type(value))
+  end
+  return value
+end
 --- Runs a chunk in the sandbox and hands back whatever it produced, unvalidated.
 ---
 --- For a file that is *not* a package manifest but wants the same guarantees: no

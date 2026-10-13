@@ -85,8 +85,8 @@ end
 
 function PanelView:_ensure_rows()
   if not self._dirty then return end
-  local entries, notice = self.collect()
-  local built = Rows.build(entries, self.query, notice)
+  local entries, notice, total = self.collect()
+  local built = Rows.build(entries, self.query, notice, total)
   self.rows    = built.rows
   self.counts  = built.counts
   self.matched = built.matched
@@ -103,8 +103,8 @@ function PanelView:refilter()
   -- actually there. Doing it from the NEW rows is the whole fix for "it says
   -- it found two but there is nothing to select": the old row index pointed at
   -- a header, or past the end, and nothing moved it back.
-  local entries, notice = self.collect()
-  local built = Rows.build(entries, self.query, notice)
+  local entries, notice, total = self.collect()
+  local built = Rows.build(entries, self.query, notice, total)
   self.rows    = built.rows
   self.counts  = built.counts
   self.matched = built.matched
@@ -437,8 +437,20 @@ function PanelView:_draw_entry(row, index, x, y, w, h)
   -- the one that varies (a version, or no version).
   local label = STATUS_LABEL[status] or status
   local right = label
-  if entry.version and entry.version ~= "" then
-    right = entry.version .. "   " .. label
+  -- An operation in flight owns the column: "cloning…" is the thing worth reading
+  -- while it runs, and the version it will replace is not installed yet anyway.
+  if entry.progress then
+    right = entry.progress
+  else
+    if entry.version and entry.version ~= "" then
+      right = entry.version .. "   " .. label
+    end
+    -- The on-disk size of an installed package, from the lock. Missing for old
+    -- installs that predate the lock carrying bytes, and absent rather than zero
+    -- then: "0 B" would claim a measurement that was never taken.
+    if entry.size then
+      right = entry.size .. "   " .. right
+    end
   end
   -- A package with features says so, and says how many are off. Without this the
   -- feature rows below it are the only sign, which means a user has to scroll to

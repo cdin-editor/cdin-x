@@ -23,7 +23,7 @@ function M.popen(cmd)
 end
 
 -- ── extension-registry fetching ───────────────────────────────────────────
--- Nothing. Fetching the cdin-x registry is not a git operation.
+-- Nothing, and nothing here should grow into something.
 --
 -- This header and the three helpers under it were the git path: `quote` and
 -- `succeeded` for `os.execute`, and `run` for the git commands themselves. They
@@ -37,11 +37,17 @@ end
 -- cannot find the program looks like a successful one. `succeeded` was three
 -- branches of guesswork about that, and nothing that ships should.
 --
--- The registry is downloaded over HTTPS by `cdinx/manager/fetch.lua`, one file plus
--- the files of the one extension being installed. git is not used to install
--- cdin-x extensions at all, and `Manager.set_registry_syncer` -- the hook this path
--- was supposed to fill -- has no callers either. That is a deliberate seam, not an
--- oversight: a third-party extension may want to provide a faster sync, and the
--- seam costs one comparison in `registry.refresh`.
+-- cdin-x installs through git, so this comment used to be wrong twice over: the
+-- registry *is* a clone now (`cdinx/manager/registry.lua` with the async work in
+-- `cdinx/manager/transport.lua`), and the HTTPS downloader it was contrasting
+-- itself with is gone. Neither belongs here. This package is about the repository
+-- the user is *working in*; cdin-x keeps its own git -- its own argv builder, its
+-- own detached jobs, its own version probe -- because a package manager's network
+-- code cannot depend on a plugin that may be disabled, not loaded yet, or the very
+-- package being installed.
+--
+-- `Manager.set_registry_syncer` was the seam this path was supposed to fill. It has
+-- never had callers and is now a deprecation shim: nothing needs to register a
+-- syncer when the registry is a clone the manager moves itself.
 
 return M

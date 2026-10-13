@@ -1,5 +1,6 @@
-local Host = require "cdinx.host"
-local Util = require "cdinx.manager.util"
+local Host   = require "cdinx.host"
+local Schema = require "cdinx.schema"
+local Util   = require "cdinx.manager.util"
 
 local State = {}
 
@@ -13,14 +14,20 @@ function State.load(config)
     return State.empty()
   end
 
-  local ok, state = pcall(dofile, file)
-  if ok and type(state) == "table" then
-    return {
-      disabled = type(state.disabled) == "table" and state.disabled or {},
-      lock     = type(state.lock) == "table" and state.lock or {},
-    }
+  -- Read through the sandbox rather than dofile()d. The file holds no code --
+  -- `save` emits a literal table and nothing else -- but it lives in a directory
+  -- the user can write to, and running it to find out which packages are
+  -- disabled means running it with the editor's privileges for no benefit.
+  local state, err = Schema.read_data(file, "extensions.lua")
+  if type(state) ~= "table" then
+    Host.core.error("cdin-x: %s is not readable; starting with nothing disabled", err)
+    return State.empty()
   end
-  return State.empty()
+
+  return {
+    disabled = type(state.disabled) == "table" and state.disabled or {},
+    lock     = type(state.lock) == "table" and state.lock or {},
+  }
 end
 
 function State.save(config, state)
@@ -39,15 +46,31 @@ function State.save(config, state)
   end
   fp:write("  },\n")
 
+  -- The lock is the reproducibility record: source, ref, rev, subdir and the
+  -- selected file count and byte total, so `restore` reinstalls exactly the
+  -- locked commits. A commit hash authenticates the tree, so no separate archive
+  -- hash exists. Only string and number fields are written, sorted, so the file
+  -- is deterministic and stays readable -- it is still data, still sandboxed on
+  -- the way back in, and still never executed.
   fp:write("  lock = {\n")
   local lock_names = {}
   for name in pairs(state.lock or {}) do lock_names[#lock_names + 1] = name end
   table.sort(lock_names)
+  local lock_fields = { "version", "installed_at", "source", "url", "ref", "rev",
+    "subdir", "files", "bytes", "prev_rev" }
   for _, name in ipairs(lock_names) do
     local entry = state.lock[name]
-    fp:write("    [", string.format("%q", name), "] = { version = ",
-      string.format("%q", entry.version or ""), ", installed_at = ",
-      string.format("%q", entry.installed_at or ""), " },\n")
+    local parts = {}
+    for _, field in ipairs(lock_fields) do
+      local value = entry[field]
+      if type(value) == "string" and value ~= "" then
+        parts[#parts + 1] = field .. " = " .. string.format("%q", value)
+      elseif type(value) == "number" then
+        parts[#parts + 1] = field .. " = " .. tostring(math.floor(value))
+      end
+    end
+    fp:write("    [", string.format("%q", name), "] = { ",
+      table.concat(parts, ", "), " },\n")
   end
   fp:write("  },\n}\n")
   fp:close()

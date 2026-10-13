@@ -38,24 +38,27 @@ config.extension_dir  = config.extension_dir
                      or (base_data .. sep .. "extensions" .. sep .. "X")
 config.registry_dir   = config.registry_dir or (env("CDIN_X_REGISTRY")
                                         or (base_data .. sep .. "registry" .. sep .. "cdin-x"))
+-- Where third-party installs live: `<name>/` holds only the selected runtime
+-- files, never a `.git`. Flat, like a build's `data/packages/`, and for the same
+-- reason -- the kernel reads it as an ordinary catalog source, so the shape is one
+-- rule rather than two. `cache/` holds transient clones, deleted after each
+-- install whether it succeeded or not.
+config.store_dir      = config.store_dir or (base_data .. sep .. "packages")
+config.cache_dir      = config.cache_dir or (base_data .. sep .. "cache")
 config.state_file     = config.state_file or (base_data .. sep .. "extensions.lua")
 -- The user's own choices, next to their init.lua and not beside the state file.
 -- Two different directories on purpose: `state_file` is written by the editor and
 -- lives with the machine's data; this one is written by the user and lives with
 -- their configuration, where they will look for it.
 config.packages_file  = config.packages_file or (base_config .. sep .. "packages.lua")
+-- Beside `packages.lua`, not beside the state file: the lock is what the user
+-- would commit and share, and a file in the machine's data directory is neither.
+-- `<data>/extensions.lua` stays the editor's own record; this is its reviewable
+-- projection, and either one can be rebuilt from the other.
+config.lock_file      = config.lock_file or (base_config .. sep .. "cdin-x.lock")
+-- The one place the registry is named. Nothing derives a second URL from it:
+-- the catalog is read out of the clone this fetches, so there is no raw-file
+-- base URL to keep in step with the branch.
 config.registry_url   = config.registry_url or "https://github.com/m-mdy-m/cdin-x.git"
-
-local function raw_url_from(url)
-  local owner, repo = tostring(url):match("github%.com[/:]([^/]+)/([^/]+)")
-  if not owner then return nil end
-  repo = repo:gsub("%.git$", "")
-  return "https://raw.githubusercontent.com/" .. owner .. "/" .. repo
-    .. "/" .. (env("CDIN_X_BRANCH") or "main")
-end
-
-config.registry_raw_url = config.registry_raw_url
-  or raw_url_from(config.registry_url)
-  or "https://raw.githubusercontent.com/m-mdy-m/cdin-x/main"
 
 return config

@@ -1,0 +1,549 @@
+-- cdin-x from a shell.
+--
+-- The same operations the panel offers, without an editor, for the three cases the
+-- panel cannot serve: a machine being provisioned, a CI job that must prove an
+-- installation is sound before using it, and a person who has just broken
+-- something and wants the truth in a terminal they can paste into an issue.
+--
+-- It runs the *kernel's* modules, not a second implementation of them. Every
+-- operation here is one call into `cdinx.manager`; the only thing this file adds
+-- is the argument handling and the printing. That is the whole reason it is small:
+-- an installer with its own logic is an installer that disagrees with the editor
+-- about what "installed" means, and the disagreement is found by a user.
+--
+--     cdin-x list                     what the catalog offers
+--     cdin-x list --installed         what is on this machine
+--     cdin-x install <name> [...]     install one or more
+--     cdin-x install-source <spec>    install from a repository or a directory
+--     cdin-x update [<name>]          update what can be updated
+--     cdin-x remove <name> [...]      remove, without deleting anything of yours
+--     cdin-x restore [<name>]         put every locked package back at its commit
+--     cdin-x lock                     print cdin-x.lock
+--     cdin-x doctor                   say whether this installation is sound
+--     cdin-x refresh                  clone or move the registry
+--
+-- Exit codes: 0 everything asked for succeeded, 1 something failed, 2 the
+-- arguments were wrong. Three, because "the thing is broken" and "I typed it
+-- wrong" are different failures and a CI job wants to tell them apart.
+--
+-- Requires git for anything that touches the network; nothing else. A spec whose
+-- `dir` is a local path needs no git at all, which is deliberate -- a working copy
+-- on a machine with no git installed is a perfectly ordinary situation.
+-- The repository root, from this file's own path, so the script runs from
+-- anywhere: `lua ../cdin-x/scripts/bin/cdin-x doctor` and a `cdin-x` on PATH
+-- both have to find `cdinx/`.
+--
+-- Two branches because a pattern has no optional group: `(.+)` needs at least one
+-- character before the separator, so a bare `scripts/bin/cdin-x` -- which is what
+-- `arg[0]` is when the script is invoked by a relative path -- is the other case.
+local script = (arg and arg[0]) or ""
+local root = script:match("^(.+)[/\\]scripts[/\\]bin[/\\]cdin%-x$")
+if not root and script:match("^scripts[/\\]bin[/\\]cdin%-x$") then root = "." end
+if not root then
+  io.stderr:write("cdin-x: cannot find the repository from " .. script .. "\n")
+  os.exit(2)
+end
+package.path = root .. "/?.lua;" .. root .. "/?/init.lua;" .. package.path
+
+local function die(fmt, ...)
+  io.stderr:write(string.format(fmt, ...), "\n")
+  os.exit(2)
+end
+
+local function out(fmt, ...)
+  io.stdout:write(string.format(fmt, ...), "\n")
+end
+
+local function usage()
+  out([[
+cdin-x <command> [arguments]
+
+  list [--installed]        what the catalog offers, or what is on this machine
+  install <name>...         install one or more packages
+  install-source <spec>     install from a repository ("owner/repo") or a directory
+  update [name]             update what can be updated, or just one
+  remove <name>...          remove packages; never deletes a directory of yours
+  restore [name]            put every locked package back at its commit
+  lock                      print cdin-x.lock
+  doctor                    say whether this installation is sound
+  refresh                   clone or move the registry
+]])
+end
+
+-- ── the environment a terminal has and the editor does not ────────────────
+--
+-- The kernel requires `core` and `core.fs`. Outside the editor those have to come
+-- from somewhere, and the honest answer is: a small adapter, here, that maps the
+-- handful of calls the kernel makes onto `io` and `os`. It is deliberately not a
+-- reimplementation -- `core.fs` in the editor is one module, and anything the
+-- kernel needs beyond what is below is a bug in the kernel's use of the host, not
+-- something to paper over with a second filesystem layer.
+--
+-- Portable across the three platforms the project installs on, because a package
+-- manager that only works where it was written is a package manager most of its
+-- users cannot use. The two platform-dependent things are the shell (cmd on
+-- Windows, `sh` elsewhere) and how a directory's existence is tested, because Lua's
+-- standard library has no `stat` and neither does anything portable on top of it.
+local sep = package.config:sub(1, 1)
+local IS_WIN = sep == "\\"
+
+local function native(path)
+  path = tostring(path)
+  if IS_WIN then return (path:gsub("/", "\\")) end
+  return path
+end
+
+--- Runs `command` and returns its standard output, or nil.
+---
+--- `sh -c` rather than a bare command: the commands below quote paths with spaces
+--- in them, and only a shell takes that quoting.
+local function shell_out(command)
+  local full = IS_WIN and ("cmd.exe /C \"" .. command .. "\"") or command
+  local pipe = io.popen(full)
+  if not pipe then return nil end
+  local text = pipe:read("*a")
+  pipe:close()
+  return text
+end
+
+local function stat(path)
+  path = native(path)
+  local handle = io.open(path, "rb")
+  if handle then
+    local size = handle:seek("end")
+    handle:close()
+    -- No mtime without a C library, and nothing in this path needs one: the only
+    -- consumer is the lock's staleness rule, and a command-line run finishes well
+    -- inside any staleness it could be mistaken for.
+    return { type = "file", size = size, mtime = os.time() }
+  end
+  -- `test -d` rather than `stat`: a directory whose name starts with `-` is a
+  -- hazard for any tool that takes it as an option, and `--` is the one answer
+  -- every shell agrees on.
+  local command = IS_WIN
+    and string.format('dir /b "%s" 2>nul', path)
+    or string.format('test -d -- "%s" && echo yes', path)
+  local pipe = io.popen(IS_WIN and ("cmd.exe /C \"" .. command .. "\"") or command)
+  if not pipe then return nil end
+  local found = pipe:read("*a")
+  pipe:close()
+  if found and found:find("%S") then return { type = "dir", size = 0, mtime = os.time() } end
+  return nil
+end
+
+local function list_dir(path)
+  local out = {}
+  local command = IS_WIN
+    and string.format('dir /b "%s" 2>nul', native(path))
+    or string.format('ls -A -- "%s" 2>/dev/null', tostring(path))
+  local pipe = io.popen(IS_WIN and ("cmd.exe /C \"" .. command .. "\"") or command)
+  if not pipe then return out end
+  for line in pipe:lines() do
+    if line ~= "" then
+      local full = native(path) .. sep .. line
+      out[#out + 1] = { name = line, type = stat(full) and stat(full).type or "file" }
+    end
+  end
+  pipe:close()
+  return out
+end
+
+local function quote_cmd(path)
+  path = native(path)
+  if IS_WIN then return string.format('"%s"', (path:gsub('"', ''))) end
+  return "'" .. (path:gsub("'", "'\\''")) .. "'"
+end
+
+--- Creates `path` and every level above it.
+---
+--- Level by level from the drive (or the root) down, because that is what a shell
+--- can be asked to do portably: `mkdir -p` is one command on one platform and not
+--- the other, and the drive letter is not a directory you can create.
+local function mkdir_p(path)
+  path = native(path)
+  local drive = path:match("^(%a:)[/\\]") or ""
+  local rest = drive ~= "" and path:sub(3) or path
+  local parts = {}
+  for part in rest:gmatch("[^/\\]+") do parts[#parts + 1] = part end
+  local built = drive
+  for _, part in ipairs(parts) do
+    built = built .. sep .. part
+    if IS_WIN then
+      shell_out("mkdir " .. quote_cmd(built) .. " 2>nul")
+    else
+      shell_out("mkdir -p " .. quote_cmd(built) .. " 2>/dev/null")
+    end
+  end
+  return stat(path) ~= nil
+end
+
+local fs = {
+  join = function(...) return table.concat({ ... }, sep) end,
+  stat = stat,
+  is_file = function(p) local s = stat(p) return s ~= nil and s.type == "file" end,
+  is_dir = function(p) local s = stat(p) return s ~= nil and s.type == "dir" end,
+  exists = function(p) return stat(p) ~= nil end,
+  mkdir = mkdir_p,
+  rm = function(p)
+    if IS_WIN then
+      shell_out(string.format('rmdir /s /q %s 2>nul & del /q %s 2>nul',
+        quote_cmd(p), quote_cmd(p)))
+    else
+      shell_out(string.format('rm -rf -- %s 2>/dev/null', quote_cmd(p)))
+    end
+    return true
+  end,
+  copy = function(from, to)
+    if IS_WIN then
+      shell_out(string.format("copy /y %s %s >nul 2>nul", quote_cmd(from), quote_cmd(to)))
+    else
+      shell_out(string.format("cp %s %s 2>/dev/null", quote_cmd(from), quote_cmd(to)))
+    end
+    return stat(to) ~= nil
+  end,
+  move = function(from, to)
+    if IS_WIN then
+      shell_out(string.format("move /y %s %s >nul 2>nul", quote_cmd(from), quote_cmd(to)))
+    else
+      shell_out(string.format("mv %s %s 2>/dev/null", quote_cmd(from), quote_cmd(to)))
+    end
+    return stat(to) ~= nil
+  end,
+  list = list_dir,
+  dirname = function(p) return (native(p):gsub("\\", "/")):match("^(.*)/[^/]*$") or "." end,
+  basename = function(p) return (native(p):gsub("\\", "/")):match("([^/]*)$") or p end,
+  abs = function(p) return native(p) end,
+}
+
+-- `core.log` outside the editor is stdout, not nothing: a command line whose
+-- progress vanishes is a command line nobody trusts to run unattended.
+local function write_line(fmt, ...)
+  if select("#", ...) > 0 then
+    io.stdout:write(string.format(fmt, ...), "\n")
+  else
+    io.stdout:write(tostring(fmt), "\n")
+  end
+end
+
+-- `system` is a host *global*, not part of `core`: `cdinx/host.lua` reaches for it
+-- unqualified, and the contract lists it among the globals the editor provides.
+-- Declared here as a real global for the same reason.
+--
+-- `exec` has to match what the host's `system.exec` *means*, not just its shape,
+-- and that took two tries to get right. The host spawns `CreateProcessW` on the
+-- command string directly, with no shell around it; `cdinx/manager/git.lua` relies
+-- on that, building its own `cmd.exe /C "..."` so it gets exactly one. `os.execute`
+-- is itself a shell, so handing it the finished command nests two -- and the inner
+-- one loses: `set GIT_ALLOW_PROTOCOL=... && git clone ...` then has its first token
+-- read as a command name, and the job never runs while the poll waits for a marker
+-- that was never going to appear.
+--
+-- So: unwrap on Windows, and let `os.execute` be the one shell. On POSIX the host
+-- appends `&` and calls `system()`, and `git.lua` builds no wrapper there, so the
+-- string is passed through unchanged -- which is what an `sh -c` wants.
+--
+-- Blocking rather than detached is the other half, and is not a shortcut: the host's
+-- rule is that a frame must never block, and a terminal has no frames. The marker
+-- exists by the time the caller polls it, either way.
+-- `CDIN_X_TRACE=1` echoes every shell command before it runs.
+--
+-- Not a debug leftover: a command line whose only output is git's own is hard to
+-- diagnose when the failure is in how the command was built rather than in git,
+-- which is exactly the class of failure a user cannot see into. One environment
+-- variable, no build flag, no rebuild.
+local TRACE = os.getenv("CDIN_X_TRACE") == "1"
+
+_G.system = {
+  exec = function(command)
+    if IS_WIN then
+      -- Greedy to the last quote, because the inner command carries quoted paths of
+      -- its own and the wrapper's closing quote is the last one in the string.
+      local inner = command:match('^cmd%.exe /C "(.*)"$')
+      command = inner or command
+    end
+    if TRACE then io.stderr:write("+ " .. command .. "\n") end
+    os.execute(command)
+  end,
+  popen = function(command)
+    -- `git.lua` uses `io.popen` directly for its own synchronous calls and never
+    -- comes through here; this exists so a module that prefers the documented
+    -- seam gets one. The same unwrapping applies, for the same reason.
+    if IS_WIN then
+      local inner = command:match('^cmd%.exe /C "(.*)"$')
+      command = inner or command
+    end
+    if TRACE then io.stderr:write("+ " .. command .. "\n") end
+    return io.popen(command)
+  end,
+  get_time = function() return os.time() end,
+  sleep = function(seconds)
+    local clock = os.clock
+    local started = clock()
+    while clock() - started < seconds do end
+  end,
+}
+
+local threads = {}
+package.preload["core"] = function()
+  return {
+    log = write_line, log_quiet = function() end, error = function(fmt, ...)
+      io.stderr:write(string.format(fmt, ...), "\n")
+    end,
+    VERSION = "0.5.0",
+    add_thread = function(fn) threads[#threads + 1] = coroutine.create(fn) end,
+    plugins = { loaded = {} },
+    docs = {},
+  }
+end
+package.preload["core.fs"] = function() return fs end
+package.preload["core.config"] = function()
+  local config = {}
+  -- The same layout the editor derives, with the same defaults, so a package
+  -- installed from here is found by the editor and the other way round. Anything
+  -- else would give two machines two answers to "what is installed", which is the
+  -- one bug this file cannot have.
+  --
+  -- Written out rather than derived from the editor's config, because that config
+  -- *is* the host's table plus these defaults: a terminal has no host to ask, so
+  -- the same variables are read here in the same order with the same fallbacks.
+  -- If cdin-x's defaults ever change, this is the second place to change, and the
+  -- disagreement it would cause is a machine with two different stores.
+  local home = os.getenv("USERPROFILE") or os.getenv("HOME") or "."
+  local appdata = os.getenv("APPDATA") or os.getenv("XDG_CONFIG_HOME")
+    or (home .. (IS_WIN and "\\AppData\\Roaming" or "/.config"))
+  local localdata = os.getenv("LOCALAPPDATA") or os.getenv("XDG_DATA_HOME")
+    or (home .. (IS_WIN and "\\AppData\\Local" or "/.local/share"))
+  local base_config = appdata .. sep .. "cdin"
+  local base_data = localdata .. sep .. "cdin"
+  config.data_dir = base_data
+  config.bundle_dir = base_data
+  config.user_root = base_config
+  config.user_dir = base_config .. sep .. "user"
+  config.extension_dir = base_data .. sep .. "extensions" .. sep .. "X"
+  config.registry_dir = os.getenv("CDIN_X_REGISTRY") or (base_data .. sep .. "registry" .. sep .. "cdin-x")
+  config.registry_url = os.getenv("CDIN_X_REGISTRY_URL") or "https://github.com/m-mdy-m/cdin-x.git"
+  config.store_dir = os.getenv("CDIN_X_STORE") or (base_data .. sep .. "packages")
+  config.cache_dir = base_data .. sep .. "cache"
+  config.state_file = base_data .. sep .. "extensions.lua"
+  config.packages_file = base_config .. sep .. "packages.lua"
+  config.lock_file = base_config .. sep .. "cdin-x.lock"
+  config.site_dir = base_data
+  -- `site_path` is a function in the host's config and cdin-x's `config.site_dir`
+  -- is built from it; that line is a cross-repo invariant and the stub has to
+  -- provide it rather than the kernel being taught to do without.
+  config.site_path = function() return base_data end
+  config.theme = "default"
+  config.plugins = true
+  return config
+end
+package.preload["core.utils.object"] = function()
+  local Object = {}
+  Object.__index = Object
+  function Object:__call(_, ...) return setmetatable({}, self) end
+  function Object:extend()
+    local cls = {}
+    for k, v in pairs(self) do
+      if type(k) == "string" and k:sub(1, 2) == "__" then cls[k] = v end
+    end
+    cls.__index = cls
+    cls.super = self
+    return setmetatable(cls, self)
+  end
+  function Object:is(T)
+    local mt = getmetatable(self)
+    while mt do
+      if mt == T then return true end
+      mt = getmetatable(mt)
+    end
+    return false
+  end
+  return Object
+end
+package.preload["core.doc"] = function()
+  return { _before_save = {}, _after_save = {}, _after_load = {} }
+end
+package.preload["core.input.command"] = function()
+  return { add = function() end, remove = function() end }
+end
+package.preload["core.input.keymap"] = function()
+  return { add = function() end, remove = function() end }
+end
+package.preload["core.themes"] = function()
+  return { add_root = function() end, rescan = function() end, names = function() return {} end,
+           load = function() end, apply = function() end }
+end
+
+-- Required before `run`, which closes over them: a local declared after a function
+-- that mentions it is a *global* to that function, and a nil global at 3am is not a
+-- thing to debug in someone else's error message.
+local Manager = require "cdinx.manager"
+local Doctor = require "cdinx.manager.doctor"
+local Lock = require "cdinx.manager.lock"
+local config = require "cdinx.config"
+
+-- ── drive the kernel's own queue ──────────────────────────────────────────
+--
+-- The editor's operations are coroutines. Here they are a loop: resume, check,
+-- until the callback has fired. The kernel is unchanged by that -- which is the
+-- point of putting the operations in a queue instead of in functions -- and the
+-- alternative would be a synchronous copy of every install path.
+--
+-- The loop is bounded, and on hitting the bound it gives up *and releases what it
+-- was holding*: an abandoned operation that keeps its lock makes the next run
+-- refuse to do anything for `LOCK_TIMEOUT`, so a hang here would become an
+-- installation that looks broken for ten minutes.
+local function run(label, start_fn)
+  local state = { done = false, ok = false, result = nil }
+  local started, err = start_fn(function(ok, result)
+    state.done, state.ok, state.result = true, ok, result
+  end)
+  if not started then
+    out("%s: %s", label, tostring(err))
+    return false
+  end
+  for _ = 1, 20000 do
+    if state.done then break end
+    local progressed = false
+    for _, co in ipairs(threads) do
+      if coroutine.status(co) ~= "dead" then
+        local good, resume_err = coroutine.resume(co)
+        if not good then
+          out("%s: %s", label, tostring(resume_err))
+          Manager.abandon_all()
+          return false
+        end
+        progressed = true
+      end
+    end
+    if not progressed then break end
+  end
+  if not state.done then
+    out("%s: did not finish; see the lines above", label)
+    Manager.abandon_all()
+    return false
+  end
+  if state.ok then return true end
+  out("%s: %s", label, tostring(state.result))
+  return false
+end
+
+-- ── commands ──────────────────────────────────────────────────────────────
+
+local argv = {}
+for i = 1, #(arg or {}) do argv[i] = arg[i] end
+local command = table.remove(argv, 1)
+
+if not command or command == "--help" or command == "-h" then
+  usage()
+  os.exit(command and 0 or 2)
+end
+
+--- The one way this process ends.
+---
+--- Every exit goes through here because every exit has the same obligation: an
+--- operation left holding a lock makes the *next* run refuse to do anything until
+--- it goes stale, so a command that crashed must not leave one behind. `abandon_all`
+--- is a no-op when nothing is in flight, which is the common case.
+local function finish(code)
+  Manager.abandon_all()
+  os.exit(code)
+end
+
+-- Boot once, so the catalog and the loaded set are the ones the editor would have.
+-- A command that needs no catalog (doctor) still gets it; the cost is one scan and
+-- the benefit is that `list` and `install` answer from the same catalog the panel
+-- would have drawn.
+Manager.bootstrap()
+
+if command == "list" then
+  local installed_only = argv[1] == "--installed"
+  Manager.scan()
+  local names = {}
+  for name, plugin in pairs(Manager.list()) do
+    if not installed_only or plugin._source == "installed" or plugin._source == "dev" then
+      names[#names + 1] = name
+    end
+  end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local plugin = Manager.list()[name]
+    out("%-24s %-10s %s", name, plugin._source or "?", plugin.version or "")
+  end
+  finish(0)
+
+elseif command == "install" then
+  if #argv == 0 then die("install needs at least one package name") end
+  local failed = false
+  for _, name in ipairs(argv) do
+    if not run("install " .. name, function(done)
+      return Manager.install_async(name, done)
+    end) then failed = true end
+  end
+  finish(failed and 1 or 0)
+
+elseif command == "install-source" then
+  if #argv == 0 then die("install-source needs \"owner/repo\", a git URL, or a directory") end
+  local entry = argv[1]
+  local kind = argv[2]
+  if kind == "dir" then
+    entry = { dir = argv[1] }
+  elseif argv[2] == "rev" and argv[3] then
+    entry = { git = argv[1], rev = argv[3] }
+  end
+  local failed = not run("install-source", function(done)
+    return Manager.install_source_async(entry, done)
+  end)
+  finish(failed and 1 or 0)
+
+elseif command == "update" then
+  local failed = not run("update", function(done)
+    return Manager.update_async(argv[1], done)
+  end)
+  finish(failed and 1 or 0)
+
+elseif command == "remove" then
+  if #argv == 0 then die("remove needs at least one package name") end
+  local failed = false
+  for _, name in ipairs(argv) do
+    local ok, err = Manager.remove(name, argv[#argv] == "--and-source")
+    if not ok then out("remove %s: %s", name, tostring(err)) failed = true end
+  end
+  finish(failed and 1 or 0)
+
+elseif command == "restore" then
+  local failed = not run("restore", function(done)
+    return Manager.restore_async(argv[1], done)
+  end)
+  finish(failed and 1 or 0)
+
+elseif command == "lock" then
+  local data, problems = Lock.load(config)
+  if not data then
+    for _, problem in ipairs(problems) do out("%s", problem) end
+    finish(1)
+  end
+  if data.registry then out("registry %s", data.registry) end
+  local names = {}
+  for name in pairs(data.packages) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do
+    local entry = data.packages[name]
+    out("%-24s %-9s %-12s %s", name, entry.source, tostring(entry.rev):sub(1, 12),
+      tostring(entry.url or entry.subdir or ""))
+  end
+  finish(0)
+
+elseif command == "doctor" then
+  local checks = Manager.doctor()
+  for _, line in ipairs(Doctor.lines(checks)) do out("%s", line) end
+  finish(Doctor.failed(checks) and 1 or 0)
+
+elseif command == "refresh" then
+  local failed = not run("refresh", function(done)
+    return Manager.refresh_registry(function(ok, rev) done(ok, rev) end)
+  end)
+  finish(failed and 1 or 0)
+
+else
+  die("unknown command %q; try `cdin-x --help`", tostring(command))
+end
