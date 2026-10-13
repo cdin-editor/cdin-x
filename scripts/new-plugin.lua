@@ -1,13 +1,13 @@
--- Scaffolds a new package, a new theme, or a new syntax definition.
+-- Scaffolds a new package, a new theme, or a new language package.
 --
 --   lua scripts/new-plugin.lua <name> [category]
 --
--- Two shapes, because a theme and a package are genuinely different things and
--- making them look alike is what kept this script wrong:
+-- Three shapes, because a theme, a package and a language definition are genuinely
+-- different things and making them look alike is what kept this script wrong:
 --
 --   a package   packages/<category>/<name>/{package.lua,init.lua,README.md}
 --   a theme     packages/system/themes/themes/<name>/theme.lua
---   syntax      X/syntax/<name>.lua
+--   syntax      packages/languages/<name>/{package.lua,syntax.lua,init.lua}
 --
 -- A package's manifest is its own file. That is the whole reason `package.lua`
 -- exists: the catalog reads a name, a version and a dependency list *before* it
@@ -17,6 +17,12 @@
 -- This used to write `X/<category>/<name>/init.lua` with the manifest inline,
 -- and it no longer does. `X/` is still a valid catalog root for a package that
 -- has not moved yet, but nothing new goes there — see X/README.md.
+--
+-- A language definition was a single file under `X/syntax/` until Phase 8, and is
+-- a package like any other now: named in the panel, installable, switchable off,
+-- and shippable by a bundle, with its identity in its manifest. Three files rather
+-- than one so that `init.lua` is the same three lines in every language package
+-- and the part that can be wrong is data.
 --
 -- ## Why nothing here goes through string.format
 --
@@ -28,45 +34,60 @@
 -- themes and nobody noticed, because the one category it did work for was not
 -- the one the usage text led with.
 --
--- So placeholders are `@NAME@` and `@CATEGORY@`, and substitution is a plain
--- `gsub`. A `%` in the body is just a `%`, and there is no arity to get wrong.
+-- So placeholders are `@NAME@`, `@CATEGORY@` and `@EXT@`, and substitution is a
+-- plain `gsub`. A `%` in the body is just a `%`, and there is no arity to get
+-- wrong.
 --
--- `@NAME@` doubles as the file extension in the syntax template, so
--- `new-plugin.lua zig syntax` writes `%.zig$`. That is only right while the two
--- happen to be the same string, which is why it is one placeholder and not two:
--- a `@EXT@` that nothing substituted is a `files` pattern matching nothing, and
--- a highlighter that claims no file highlights nothing, silently.
+-- `@NAME@` and `@EXT@` are separate for a reason this file used to get wrong: it
+-- derived the extension from the name, so `new-plugin.lua javascript syntax` wrote
+-- `%.javascript$` and highlighted nothing at all. A `files` pattern that matches
+-- nothing fails silently, which is the worst shape a mistake can have.
 
 local name = arg[1]
 local category = arg[2] or "utils"
 
 if not name or not name:match("^[%w._-]+$") then
   print("Usage: lua scripts/new-plugin.lua <name> [category]")
-  print("  categories: editing, navigation, system, vcs")
+  print("  categories: editing, languages, navigation, system, vcs")
   print("  For a theme: lua scripts/new-plugin.lua <name> themes")
-  print("  For a syntax definition: lua scripts/new-plugin.lua <name> syntax")
+  print("  For a language package: lua scripts/new-plugin.lua <name> syntax")
   os.exit(1)
 end
 
 -- `theme` is what people type; a theme is not a package, so it takes a different
 -- branch entirely rather than being a category.
 local is_theme = category == "themes" or category == "theme"
+local is_syntax = category == "syntax" or category == "languages"
+
+--- The extension a `files` pattern should claim, when it is not the name.
+---
+--- Written out rather than derived: `javascript`, `typescript`, `markdown` and
+--- `python` are the names where deriving gets it wrong, and getting it wrong
+-- produces a package that loads and highlights nothing.
+local EXTENSIONS = {
+  javascript = "js", jsx = "jsx", typescript = "ts", tsx = "tsx",
+  markdown = "md", python = "py", lua = "lua", c = "c", cpp = "cpp",
+  ruby = "rb", rust = "rs", shell = "sh", bash = "sh", toml = "toml",
+  yaml = "yml", zig = "zig", elixir = "ex", haskell = "hs",
+}
+local ext = EXTENSIONS[name] or name
 
 local base
 if is_theme then
   base = "packages/system/themes/themes/" .. name
-elseif category == "syntax" then
-  base = "X/syntax/" .. name
+elseif is_syntax then
+  base = "packages/languages/" .. name
 else
   base = "packages/" .. category .. "/" .. name
 end
 
---- Writes `body` with `@NAME@` replaced by `name`, and `@CATEGORY@` by the
---- category. The two are different values and conflating them is how a manifest
---- ends up claiming `category = "my-plugin"`.
+--- Writes `body` with `@NAME@` replaced by `name`, `@CATEGORY@` by the
+--- category, and `@EXT@` by the extension. The three are different values and
+--- conflating them is how a manifest ends up claiming `category = "my-plugin"`.
 local function fill(body)
   local out = body:gsub("@NAME@", name)
-  out = out:gsub("@CATEGORY@", is_theme and "system" or category)
+  out = out:gsub("@EXT@", ext)
+  out = out:gsub("@CATEGORY@", is_theme and "system" or (is_syntax and "syntax" or category))
   return out
 end
 
@@ -127,67 +148,111 @@ return {
 }
 ]])
 
-elseif category == "syntax" then
-  -- The shape is copied from X/syntax/lua.lua, because getting it wrong is
-  -- invisible: `core.syntax.add` is called from `init`, so a definition with the
-  -- wrong keys registers nothing and highlights nothing, and there is no error.
+elseif is_syntax then
+  -- Three files, and the split is the point: `init.lua` is identical in every
+  -- language package, so the only part a person has to get right is the definition
+  -- in `syntax.lua` -- and the definition being data is what lets it be read,
+  -- diffed and reviewed without knowing anything about how it is registered.
   --
-  -- Every pattern is a **Lua pattern**, not a regular expression. That is why
+  -- The pattern list is copied from packages/languages/lua/syntax.lua, because
+  -- getting it wrong is invisible: `core.syntax.add` validates nothing, so a
+  -- definition with the wrong keys registers and highlights nothing, with no error
+  -- anywhere.
+  --
+  -- Every pattern below is a **Lua pattern**, not a regular expression. That is why
   -- `%-%-` is a comment and not `--`, and why `%s` is whitespace and not `\s`.
-  files[base .. ".lua"] = fill([[-- @NAME@.lua - single-file language definition.
---
--- The manifest fields live at the top level of the returned table, and `init` is
--- what registers the definition. `unload` is empty on purpose: the highlighter
--- has no remove, so there is nothing here that can be undone, and an empty
--- function is a true statement rather than a missing one.
+  files[base .. "/syntax.lua"] = fill([[-- The @NAME@ syntax definition. Data only: no
+-- require, no functions.
 --
 -- Every pattern below is a Lua pattern. There is no `\b`; use `%w`, `%d`, `%s`.
 -- A `{ "open", "close", "\\" }` pattern is a delimited form, and it is what a
 -- string with escapes wants -- a bare `"[^"]*"` stops at the first escaped quote.
+--
+-- The types below are keys under `style.syntax`. Define every type you emit: the
+-- host does not validate them, one of the three draw paths falls back to `normal`
+-- and the other two hand the missing colour to the renderer and get opaque white.
+return {
+  files = "%.@EXT@$",
+  headers = "^#!.*[ /]@NAME@",   -- a shebang, for extensionless files
+  comment = "#",
+  patterns = {
+    { pattern = { '"', '"', '\\' },  type = "string"   },
+    { pattern = { "'", "'", '\\' },  type = "string"   },
+    { pattern = { "@", "@" },        type = "comment"  },  -- your line comment
+    { pattern = "#.-\n",            type = "comment"  },
+    { pattern = "-?0x%x+",          type = "number"   },
+    { pattern = "-?%d+[%d%.eE]*",   type = "number"   },
+    { pattern = "[%+%-=/%*%^#<>]",  type = "operator" },
+    { pattern = "[%a_][%w_]*",      type = "symbol"   },
+  },
+  symbols = {
+    ["if"]     = "keyword",
+    ["else"]   = "keyword",
+    ["for"]    = "keyword",
+    ["while"]  = "keyword",
+    ["return"] = "keyword",
+    ["true"]   = "literal",
+    ["false"]  = "literal",
+    ["nil"]    = "literal",
+  },
+}
+]])
+
+  -- The header is assigned first and filled second, because a `fill` on a long
+  -- literal starts the line at column one and the templates below all exceed 100
+  -- columns by design (they are Lua patterns).
+  local init_header = [[
+-- Registers the @NAME@ syntax definition, and cannot take it back.
+--
+-- `core.syntax.add` appends to a list the host walks backwards, and the contract
+-- says plainly that there is no `remove`: a definition added from a package's
+-- `init` lasts for the session. So `unload` is empty, and that is the documented
+-- shape rather than an oversight -- the alternative is reaching into the host's
+-- table to find and cut the entry, which the contract forbids and which would
+-- leave the tokenizer holding a table this package no longer owns.
+--
+-- The guard is not decoration. This file is dofile'd as the entry point and may
+-- also be require'd by another package, and those are two module instances with
+-- two independent guards; without it both register and the second definition wins.
+local M = {}
+
+function M.init()
+  if M.registered then return end
+  M.registered = true
+  require("core.syntax").add(require("@NAME@.syntax"))
+end
+
+function M.unload()
+  M.registered = false
+end
+
+return M
+]]
+
+  files[base .. "/init.lua"] = fill(init_header)
+
+  files[base .. "/package.lua"] = fill(
+[[-- The manifest for the @NAME@ language package. Data only: no require, no
+-- functions.
+--
+-- A language package is a manifest and a definition, and nothing else: there is
+-- no command, no key and no panel of its own. What it offers is that a file of
+-- this language is highlighted once the package is loaded.
 return {
   name = "@NAME@",
+  kind = "plugin",
   version = "0.1.0",
   description = "@NAME@ syntax support",
-  author = "cdin Team",
+  authors = { "cdin Team" },
   license = "MIT",
-  category = "syntax",
-  type = "plugin",
-  dependencies = {  },
-  min_cdin_version = "0.5.0",
   tags = { "language", "@NAME@" },
-  init = function(core, config)
-    local syntax = require "core.syntax"
 
-    syntax.add {
-      files = "%.@NAME@$",
-      headers = "^#!.*[ /]@NAME@",   -- a shebang, for extensionless files
-      comment = "#",
-      patterns = {
-        { pattern = { '"', '"', '\\' },  type = "string"   },
-        { pattern = { "'", "'", '\\' },  type = "string"   },
-        { pattern = { "@", "@" },        type = "comment"  },  -- your line comment
-        { pattern = "#.-\n",            type = "comment"  },
-        { pattern = "-?0x%x+",          type = "number"   },
-        { pattern = "-?%d+[%d%.eE]*",   type = "number"   },
-        { pattern = "[%+%-=/%*%^#<>]",  type = "operator" },
-        { pattern = "[%a_][%w_]*",      type = "symbol"   },
-      },
-      symbols = {
-        ["if"]     = "keyword",
-        ["else"]   = "keyword",
-        ["for"]    = "keyword",
-        ["while"]  = "keyword",
-        ["return"] = "keyword",
-        ["true"]   = "literal",
-        ["false"]  = "literal",
-        ["nil"]    = "literal",
-      },
-    }
-  end,
+  category = "@CATEGORY@",
+  min_cdin_version = "0.5.0",
 
-  unload = function() end,
+  entry = "init.lua",
 }
-]], name)
+]])
 
 else
   -- Two files, because the two things a package registers are the two things that
@@ -266,10 +331,11 @@ is a theme that quietly looks like another one.
 
 Run `make validate`. A theme ships only if a bundle in `bundles/` names it.
 ]])
--- A syntax definition is one file beside the others in X/syntax/, and that
--- directory has one README listing all of them. A per-file README would be a
--- second place to forget to update.
-elseif category ~= "syntax" then
+-- No README for a language package: it has nothing to say that its manifest and
+-- its definition do not, and a per-package README is a second place to forget to
+-- update. The tree-level `docs/building/a-syntax-definition.md` is where a
+-- language definition is explained, and it is the owner's file.
+elseif not is_syntax then
   files[base .. "/README.md"] = fill([[# @NAME@
 
 A CDIN-X package.
@@ -287,7 +353,7 @@ end
 
 --- Whether anything here already exists, so a second run does not truncate it.
 --- `new-plugin.lua lua syntax` in this repository would overwrite the real
---- `X/syntax/lua.lua`, and "wb" truncates without asking.
+--- `packages/languages/lua/syntax.lua`, and "wb" truncates without asking.
 local function existing(paths)
   local hits = {}
   for _, path in ipairs(paths) do
@@ -327,7 +393,17 @@ end)()) do
 end
 
 if is_theme then
-  print("A theme ships only if a bundle in bundles/ names it. See X/README.md.")
+  -- `bundles/README.md`, not the X/ one that used to be named here: Phase 9
+  -- deleted `X/` and the sentence about which bundle ships a theme did not move
+  -- with it.
+  print("A theme ships only if a bundle in bundles/ names it. See bundles/README.md.")
+elseif is_syntax then
+  -- `make index` and nothing else. There used to be a second command to suggest --
+  -- `make manifest`, which regenerated `X/manifest.lua` -- and Phase 9 removed both
+  -- it and the directory it wrote to. `registry/generated/catalog.lua` is the only
+  -- generated index left, so this is the whole "make it visible" step.
+  print("Next: make index && make validate")
+  print("A language package ships only if a bundle in bundles/ names it.")
 else
-  print("Next: make manifest && make validate")
+  print("Next: make index && make validate")
 end

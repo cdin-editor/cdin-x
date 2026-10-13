@@ -8,10 +8,15 @@
 Three directories go into the site directory, and that is the whole install:
 
     <site>/cdinx/             the kernel
-    <site>/X/                 what has not moved into packages/ yet -- which is
-                               now vim and the syntax definitions
-    <site>/packages/          first-party packages
+    <site>/packages/          first-party packages: vim, the themes, the
+                               language definitions
     <site>/plugins/cdin-x/    the entry plugin the host loads
+
+There was a fourth, `<site>/X/`, and there is not any more. `X/` held every
+package before `packages/` existed, then only vim, then only the generated
+catalog manifest and the six language definitions; Phase 9 removed it, and with it
+the second catalog root that made every reader in this repository ask "which of
+the two did you mean".
 
 The site directory is the host's `config.site_dir`:
 <data_home>/cdin/site, where data_home is $XDG_DATA_HOME or ~/.local/share
@@ -42,24 +47,28 @@ from pathlib import Path
 
 # (source, destination relative to the site directory).
 #
-# `X/` and `packages/` are both required now. They were not always: during the move
-# out of X/, `packages/` did not exist yet and X/ held everything, so it was the one
-# that could not be optional. That is over -- themes are a package, vim is the last
-# entry in X/ -- and the two are a single install again. They stay as two entries
-# rather than one because they are two roots and either may move again, and
-# unpicking a merged directory is worse than adding a line here.
+# Three entries, and there were four. `X/` was one of them for as long as anything
+# lived there -- it held everything before `packages/` existed, then vim, then the
+# generated manifest and the language definitions. Phase 9 removed the directory.
+# It was never optional: a root the kernel scans cannot be missing, or the install
+# is half a catalog.
 #
 # What a build carries is a *bundle's* list and is scripts/bundle.py's job. A user
 # install is the whole catalog.
 PAYLOAD = [
     ("cdinx", "cdinx"),
-    ("X", "X"),
     ("packages", "packages"),
     ("plugins/cdin-x", "plugins/cdin-x"),
 ]
 
 # Nothing. Kept as an empty list so the loop below has one code path: a root that
 # becomes optional later is a line moved out of PAYLOAD, not a second mechanism.
+#
+# `X/` was in PAYLOAD until Phase 9 and is the reason this list exists at all -- it
+# never became optional, it was deleted. A `--site` that still has an `X/` in it
+# from an older install is left alone rather than deleted: this script removes only
+# what it put there, and everything under that path was put there by an older
+# version of this script.
 OPTIONAL_PAYLOAD = []
 
 
@@ -267,8 +276,15 @@ def main() -> int:
     site = (args.site or default_site()).expanduser()
     root = repo_root()
 
-    if not args.uninstall and not (root / "X").is_dir():
-        die("no X/ under {} — is this a cdin-x checkout?".format(root))
+    # "Is this a cdin-x checkout?" answered by the one directory that cannot be
+    # anything else. It was `X/` for as long as there were two catalog roots, which
+    # made the check cheap but tied to the layout; Phase 9 removed `X/`, and
+    # `packages/` is the directory whose absence really does mean this is not a
+    # cdin-x tree. `cdinx/` alone would not: a partial checkout of the kernel is a
+    # thing a broken clone produces, and installing from it gives an editor with no
+    # packages and no error.
+    if not args.uninstall and not (root / "packages").is_dir():
+        die("no packages/ under {} — is this a cdin-x checkout?".format(root))
 
     print("cdin-x {}".format(
         "uninstall" if args.uninstall

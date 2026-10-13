@@ -4,8 +4,6 @@
 #
 #   build      the catalog is valid and the bundle a cdin build reads is
 #              reproducible and complete          (bundle.yml)
-#   manifest   X/manifest.lua is generated, not stale, and nothing in it is
-#              hand-edited
 #   install    `make install` works on Linux, macOS and Windows
 #   contract   cdin, given this checkout as its site directory, still loads it
 #              (contract.yml)
@@ -43,88 +41,6 @@ jobs:
     name: Validate + bundle
     uses: ./.github/workflows/bundle.yml
 
-  manifest:
-    name: Manifest is current
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install Lua 5.4
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends lua5.4
-          lua5.4 -v
-          # `lua5.4` is the package; whether the image also provides `lua` is up
-          # to the runner. The Makefile's default is `lua`, so give it one.
-          command -v lua >/dev/null 2>&1 || \
-            sudo ln -sf "$(command -v lua5.4)" /usr/local/bin/lua
-          lua -v
-
-      # X/manifest.lua is generated. A generated file that is only regenerated
-      # when someone remembers is a file that lies: the catalog and the
-      # manifest disagree, and nothing anywhere reports an error, because the
-      # dependency check in validate.lua reads the manifest and so validates
-      # against the stale copy and passes.
-      #
-      # The failure message therefore does NOT say "run make manifest". On a
-      # broken scanner that advice destroys the file: the generator opens
-      # X/manifest.lua for writing *before* it knows how many entries it found,
-      # so a scan that finds none replaces a 44-entry catalog index with a
-      # 29-line stub. CONTRIBUTING.md step 2 tells contributors to run exactly
-      # that, which is how it happens.
-      #
-      # Compared with line endings stripped, on purpose. generate-manifest.lua
-      # writes CRLF explicitly and there is no .gitattributes, so a plain
-      # `git diff` would report the whole file changed on every runner and the
-      # check could never pass.
-      - name: Regenerate and compare
-        shell: bash
-        run: |
-          set -euo pipefail
-          committed="$RUNNER_TEMP/manifest.committed"
-          cp X/manifest.lua "$committed"
-          before=$(grep -cP '^    \["' "$committed" || true)
-
-          lua scripts/generate-manifest.lua
-
-          after=$(grep -cP '^    \["' X/manifest.lua || true)
-          if [ "$after" -eq 0 ]; then
-            {
-              echo "::error title=the generator found nothing::X/manifest.lua now has 0 entries."
-              echo ""
-              echo "The committed manifest has ${before}. Do **not** commit this."
-              echo ""
-              echo "The generator opened the file for writing before counting, so running"
-              echo "\`make manifest\` here replaces a ${before}-entry index with an empty one."
-              echo ""
-              echo "Almost always \`scripts/_scan.lua\`'s M.list_dir, which shells out and parses"
-              echo "output that only the Windows branch prefixes. Restore the committed file:"
-              echo ""
-              echo '    git checkout -- X/manifest.lua'
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          if ! diff -u \
-                <(tr -d '\r' < "$committed") \
-                <(tr -d '\r' < X/manifest.lua); then
-            {
-              echo "::error title=stale manifest::X/manifest.lua does not match what scripts/generate-manifest.lua produces."
-              echo ""
-              echo "committed: ${before} entries   regenerated: ${after} entries"
-              echo ""
-              echo "Both numbers non-zero, so this is real drift, not a broken scan."
-              echo "Regenerate and commit it:"
-              echo ""
-              echo '    make manifest && git add X/manifest.lua && git commit -m "chore(catalog): regenerate the manifest"'
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-
-          echo "✓ manifest is current — $after entries, byte-identical (line endings aside)"
-
   install:
     name: Install
     strategy:
@@ -143,16 +59,23 @@ jobs:
   # set of independent rules and each failure names its own problem, so the one
   # thing worth surfacing separately is whether the cross-repository half ran
   # at all — a green run that skipped it should not read as green.
+  #
+  # This job lists its needs by hand, and each `needs.X.result` it reads must
+  # name a job above or the workflow does not load: GitHub rejects a `needs`
+  # entry that matches no job rather than reporting it as skipped. Phase 9
+  # deleted the `manifest` job and left four references to it here, which made
+  # every push fail before a single check ran. A job added above and not added
+  # here is a check that runs but cannot gate a release; a job removed above and
+  # not here is a workflow that does not parse. Both are the same edit.
   required:
     name: Required checks
     runs-on: ubuntu-latest
-    needs: [build, manifest, install, contract]
+    needs: [build, install, contract]
     if: always()
     steps:
       - name: Report
         env:
           BUILD: ${{ needs.build.result }}
-          MANIFEST: ${{ needs.manifest.result }}
           INSTALL: ${{ needs.install.result }}
           CONTRACT: ${{ needs.contract.result }}
           RAN: ${{ needs.contract.outputs.ran }}
@@ -163,7 +86,6 @@ jobs:
             echo "| job | result |"
             echo "|-----|--------|"
             echo "| validate + bundle | $BUILD |"
-            echo "| manifest | $MANIFEST |"
             echo "| install (linux/macos/windows) | $INSTALL |"
             echo "| contract with cdin | $CONTRACT |"
             echo ""
@@ -175,7 +97,7 @@ jobs:
 
       - name: Fail if anything failed
         run: |
-          for job in "$BUILD" "$MANIFEST" "$INSTALL" "$CONTRACT"; do
+          for job in "$BUILD" "$INSTALL" "$CONTRACT"; do
             if [ "$job" != "success" ]; then
               echo "::error::a required job reported: $job"
               exit 1

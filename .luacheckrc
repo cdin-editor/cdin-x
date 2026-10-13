@@ -31,11 +31,6 @@ globals = { "package.cdinx_store" }
 read_globals = {
   "ARGS", "VERSION", "PLATFORM", "SCALE", "EXEFILE", "EXEDIR", "PATHSEP",
   "system", "renderer", "CDIN_VERSION", "LOGFILE",
-
-  -- `package.loaders` is the Lua 5.1 spelling of `package.searchers`, still read
-  -- for a host that is that old. Read-only, so it belongs here rather than in
-  -- `globals` above.
-  "package.loaders",
 }
 
 files["scripts/"] = {

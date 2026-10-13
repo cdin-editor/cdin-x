@@ -10,25 +10,29 @@ wants nothing from this repository, and the default is `standard` because
 cdin's build calls this with --out and nothing else.
 
     <DEST>/cdinx/**               the kernel, verbatim
-    <DEST>/X/<relpath>/**         every package in the closure, verbatim
-    <DEST>/plugins/cdin-x.lua     the kernel's entry point
-    <DEST>/plugins/<n>.lua        one-line shim: return require("<the package's name>")
+    <DEST>/plugins/cdin-x.lua     the kernel's entry point -- the only shim
+    <DEST>/packages/<name>/**     every package in the closure, verbatim
     <DEST>/themes/<t>/**          every theme in the closure
     <DEST>/<support>/**           every `bundle_with` path a member declares
     <DEST>/fonts/**               copy of this repository's fonts/
     <DEST>/BUNDLE.lua             return { plugins = {...}, themes = {...} }
 
-Why the shims: the host's plugin loader looks for plugins in one bundled
-directory, and it dofile()s the entry point it finds there. vim's real entry
-point is X/core/vim/init.lua, and loading it by that path would run the file a
-second time under a different module identity. A one-line shim that `require`s
-the real module gives the host the name it wants without giving vim a second
-init. The kernel's own shim is generated the same way, from the module
-plugins/cdin-x/init.lua asks for, so the entry point is written in one place.
+Why one shim and not one per package: the host's plugin loader looks in one
+bundled directory and dofile()s every entry point it finds there, so anything in
+<data>/plugins is loaded unconditionally and cannot be taken off. Putting a
+package there therefore makes it permanent, which is exactly what this layout
+exists to stop -- `vim` is in the default bundle and a user must be able to turn
+it off. The build's packages go to <data>/packages instead, which the host never
+looks at; the kernel reads it and loads each entry like any other package, so
+turning one off is a row in the panel.
+
+The kernel still needs a shim, because the host has to be told to load it, and
+the module it shims is read out of plugins/cdin-x/init.lua rather than written
+here, so the site install and a build cannot drift apart.
 
 `bundle_with` is the same problem one level up. A package may have code that
-does not live under X/: declaring `bundle_with = { "some/dir" }` copies those
-paths into the destination with their layout intact, so `require "some.dir"`
+does not live under `packages/`: declaring `bundle_with = { "some/dir" }` copies
+those paths into the destination with their layout intact, so `require "some.dir"`
 resolves from <DEST>/ exactly as it does from a checkout. The bundler does not
 guess at this: an undeclared dependency is a build whose editor starts and then
 does nothing, which is not a failure anyone should have to debug at runtime.
@@ -59,14 +63,22 @@ from typing import Dict, List, NoReturn, Optional, Sequence, Tuple, TypedDict
 # Repository layout, in one place: the kernel, the first-party catalog and the
 # bundles that name a subset of it.
 #
-# CATALOG_ROOTS is a list because the move out of X/ is in progress: a package
-# is found under whichever root has it, so the tree can be half-moved and both
-# the bundler and the editor still see every package. CATALOG_DIR is where a
-# package lands in the *bundle*, which is one place until the kernel owns the
-# shipped set and they move to data/packages/.
+# CATALOG_ROOTS is a list because every caller walks it, and a collection whose
+# shape changes when a second root is added is a collection every caller has to be
+# re-read after. One root since Phase 9 removed `X/`.
+# PACKAGES_DIR is where a package lands in a *build* -- flat, under its own name,
+# because a build carries a named set rather than a tree and the kernel reads that
+# root as an ordinary catalog source.
 KERNEL_DIR = "cdinx"
-CATALOG_ROOTS = ("packages", "X")
-CATALOG_DIR = "X"
+CATALOG_ROOTS = ("packages",)
+PACKAGES_DIR = "packages"
+# Directories this script used to write into a build and no longer does. They are
+# still cleared, and that is the point of the list: a build directory outlives the
+# script version that made it, so a stale copy of a package under `X/` would be
+# picked up by the catalog scanner of any editor opened on that build. Phase 9 made
+# `X/` a root nobody scans, which is what turns "cleared" from tidiness into the
+# thing that makes an old build safe to open.
+RETIRED_DIRS = ("X",)
 # Where a theme lands in a build. Not ours to choose: the host reads
 # <data>/themes/<name>/theme.lua and cdin's extension contract says so.
 THEME_DIR = "themes"
@@ -82,6 +94,15 @@ KERNEL_SHIM = "plugins/cdin-x.lua"
 # script with --out and nothing else, so the default is not optional: it is the
 # set an editor has to have to be usable.
 DEFAULT_BUNDLE = "standard"
+
+# What a package installs when it says nothing. `package.lua` first, because a
+# selection without it is not a package; `LICENSE*` and `NOTICE*` because shipping
+# someone's code without their licence text is not a style question. The Lua twin
+# of both lists is cdinx/manager/select.lua, and validate.lua runs the two over
+# every first-party package and fails if they disagree.
+DEFAULT_FILES = ["package.lua", "**/*.lua", "LICENSE*", "NOTICE*", "README.md"]
+DEFAULT_IGNORE = ["test/**", "tests/**", "spec/**", "**/*_spec.lua",
+                  "**/*_test.lua", "examples/**", "docs/**", ".*/**"]
 
 # `return require("X.core.manager")`, which is the whole of the site entry.
 ENTRY_MODULE_RE = re.compile(r'return\s+require\s*\(?\s*"([^"]+)"')
@@ -117,10 +138,10 @@ class Package(TypedDict):
 
     name: str
     kind: str  # "plugin" or "theme"
-    root: Path  # the directory to copy
-    rel: str  # its path under X/, forward slashes
-    module: str  # its module prefix, "" for a theme
-    category: str  # where it lands in the bundle: its declared one, else the domain
+    root: Path  # the directory to copy, or the one .lua file it is
+    rel: str  # its path under its catalog root, forward slashes
+    single_file: bool  # True when root is one .lua file rather than a directory
+    category: str  # its declared category, else the directory it sits in
     dependencies: List[str]
     bundle_with: List[str]
 
@@ -252,20 +273,6 @@ def manifest_file(root: Path) -> Optional[Path]:
     return None
 
 
-def module_prefix(rel: str, single_file: bool, name: str = "") -> str:
-    """The require name that resolves to a package's own files.
-
-    A package with a package.lua is reached by its name — that is the point of
-    the name — and so is the shim the host loads. A package without one is still
-    reached by where it sits, because that is all it has.
-    """
-    if name:
-        return name
-    if single_file:
-        return "X." + rel[: -len(".lua")].replace("/", ".")
-    return "X." + rel.replace("/", ".")
-
-
 def add_package(
     catalog: Dict[str, Package],
     root: Path,
@@ -285,7 +292,7 @@ def add_package(
         kind=kind,
         root=root,
         rel=rel,
-        module=module_prefix(rel, single_file, name),
+        single_file=single_file,
         # A declared category wins over the domain directory it sits in, because
         # that is where the panel says it belongs; the directory is only the
         # fallback, and only for a package that states none.
@@ -321,7 +328,6 @@ def scan_dir(base: Path, rel: str, catalog: Dict[str, Package]) -> None:
 
 def scan_catalog(root: Path) -> Dict[str, Package]:
     """Every package in this checkout, keyed by the name it declares."""
-    catalog_root = root / CATALOG_DIR
     if not any((root / r).is_dir() for r in CATALOG_ROOTS):
         die("none of {} under {} — is --cdinx-root pointing at a cdin-x checkout?"
             .format(" or ".join(CATALOG_ROOTS), root))
@@ -331,11 +337,143 @@ def scan_catalog(root: Path) -> Dict[str, Package]:
         if not catalog_root.is_dir():
             continue
         # `rel` is relative to the root, so a package found under either root has
-        # the same identity and the same destination in the bundle.
+        # the same identity. The destination no longer depends on it: a build is
+        # flat, and a package's name is where it lands.
         for domain in sorted(catalog_root.iterdir(), key=lambda p: p.name):
             if domain.is_dir() and not is_link(domain):
                 scan_dir(domain, domain.name, catalog)
     return catalog
+
+
+# ── the file selection ────────────────────────────────────────────────────
+#
+# The Lua twin is cdinx/manager/select.lua. The grammar is duplicated here because
+# the bundler cannot run Lua, and the two are kept in step by a rule in
+# validate.lua that runs both over every first-party package and fails if they
+# disagree. A divergence is a build that ships a file the editor would not have
+# installed, or the reverse -- and neither is visible until a user reports it.
+#
+# The grammar is deliberately the smallest one that covers a package: literal
+# names, `*` (no `/`), `**` (any depth, as a whole segment), `/` as the separator.
+# `**/` compiles to two alternatives -- zero directories, or one or more -- because
+# a regex has no "optional group" that a Lua pattern can express, and the two
+# implementations have to agree on the same paths.
+
+# What a regex gives a meaning to, so a literal glob character can be escaped.
+#
+# A plain string, not a compiled character class: a class written to contain `[` is
+# parsed by Python 3.7+ as a *nested* set, which changes what it matches -- it
+# stopped matching `.` entirely, so `**/*.lua` compiled to a pattern that matched
+# `xluax` as well as `x.lua`. Membership in a string cannot be misparsed.
+_REGEX_MAGIC = "\\^$.|?*+()[]{}"
+
+
+def _literal(char):
+    return "\\" + char if char in _REGEX_MAGIC else char
+
+
+def expand_glob(glob):
+    """One glob -> a list of regex patterns, or None plus a reason.
+
+    A list, for the same reason the Lua version returns a list: `**/` means "zero
+    or more directories", and the only way to say that in both languages is two
+    patterns that are each obviously right.
+    """
+    if not isinstance(glob, str) or glob == "":
+        return None, "a glob must be a non-empty string"
+    if "\\" in glob:
+        return None, "{} uses backslashes; a `files` glob always uses '/'".format(glob)
+    if glob.startswith("/"):
+        return None, "{} is not relative to the package root".format(glob)
+    if glob.endswith("/"):
+        return None, "{} ends with '/', which names no file".format(glob)
+    if "//" in glob:
+        return None, "{} has an empty path segment".format(glob)
+    for segment in glob.split("/"):
+        if segment == "..":
+            return None, "{} climbs out of the package".format(glob)
+    if any(ord(c) < 32 for c in glob):
+        return None, "{} contains a control character".format(glob)
+
+    alternatives = [""]
+    i, n = 0, len(glob)
+    while i < n:
+        char = glob[i]
+        if char == "*":
+            if i + 1 < n and glob[i + 1] == "*":
+                before_ok = (i == 0) or (glob[i - 1] == "/")
+                after = glob[i + 2] if i + 2 < n else ""
+                if not (before_ok and after in ("", "/")):
+                    return None, "{} puts '**' inside a path segment".format(glob)
+                if after == "/":
+                    alternatives = alternatives + [p + ".*/" for p in alternatives]
+                    i += 3
+                else:
+                    alternatives = [p + ".*" for p in alternatives]
+                    i += 2
+            else:
+                alternatives = [p + "[^/]*" for p in alternatives]
+                i += 1
+        else:
+            alternatives = [p + _literal(char) for p in alternatives]
+            i += 1
+
+    # Two values always, success or failure, so a caller can write
+    # `patterns, err = expand_glob(g)` without a special case for the good path.
+    # The Lua twin answers the same way.
+    return ["^" + p + "$" for p in alternatives], None
+
+
+def _compiled(globs):
+    out = []
+    for glob in globs:
+        patterns, err = expand_glob(glob)
+        if err:
+            return None, err
+        out.extend(patterns)
+    return out, None
+
+
+def _forbidden(relpath):
+    """.git at any depth, whatever the globs say."""
+    return ".git" in relpath.split("/")
+
+
+def select_files(root, files=None, ignore=None):
+    """The files of one package that would be installed, as relative paths.
+
+    `root` is a directory on disk. Symlinks are never selected and never followed:
+    copying one would either duplicate its target or pull in something from outside
+    the repository, and the selection is of the repository.
+    """
+    files = list(files) if files is not None else list(DEFAULT_FILES)
+    ignore = list(ignore) if ignore is not None else list(DEFAULT_IGNORE)
+
+    file_pats, err = _compiled(files)
+    if err:
+        return None, "files: " + err
+    ignore_pats, err = _compiled(ignore)
+    if err:
+        return None, "ignore: " + err
+
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Pruned rather than skipped: descending into .git would walk a whole
+        # repository's history to select nothing from it.
+        dirnames[:] = sorted(d for d in dirnames
+                             if d != ".git" and not is_link(os.path.join(dirpath, d)))
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            if is_link(full):
+                continue
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            if _forbidden(rel):
+                continue
+            if any(re.search(p, rel) for p in ignore_pats):
+                continue
+            if any(re.search(p, rel) for p in file_pats):
+                out.append(rel)
+    return out, None
 
 
 # ── bundles ─────────────────────────────────────────────────────────────
@@ -534,10 +672,22 @@ def reset(out: Path, support: Sequence[str] = ()) -> None:
     runtime and is not ours to touch.
 
     The kernel and `support` are ours too, and they are cleared here for the
-    same reason X/ is: a directory this script copies into and does not clear
-    is how a file deleted from a package survives in every build after it.
+    same reason `packages/` is: a directory this script copies into and does not
+    clear is how a file deleted from a package survives in every build after it.
     """
-    owned = [KERNEL_DIR, CATALOG_DIR, "plugins", "themes", FONT_DIR]
+    owned = [KERNEL_DIR, PACKAGES_DIR, "plugins", "themes", FONT_DIR]
+    # What earlier versions of this script wrote here. `X/` held the build's
+    # packages until the kernel took ownership of the shipped set, and held the
+    # generated manifest until Phase 9; a build directory made before that is a
+    # real thing on a user's disk, and leaving it behind would keep a whole dead
+    # copy of every bundled package alive in every build directory that was ever
+    # produced. Phase 9 removed `X/` as a catalog root, so that copy is no longer
+    # loadable -- but it is still on the user's disk, and clearing it is the only
+    # way it goes away. Nothing here is the user's: every file under it was written
+    # by a previous version of this script.
+    for name in RETIRED_DIRS:
+        if name not in owned:
+            owned.append(name)
     for path in support:
         top = path.replace("\\", "/").split("/")[0]
         if top and top not in owned:
@@ -601,26 +751,31 @@ def write_bundle(root: Path, out: Path, bundle_name: str) -> int:
     copy_tree(root / KERNEL_DIR, out / KERNEL_DIR)
     write_shim(out / KERNEL_SHIM, kernel_module(root))
 
-    # The closure, each package at its place under X/ so that a require of one
-    # of its own modules resolves the same way it does here.
+    # The closure, flat: one directory per package, named for the package.
+    #
+    # Flat rather than `<category>/<name>/`, because this root is not a copy of
+    # the repository -- it is a named set, and the kernel reads it as an ordinary
+    # catalog source. A build has no domain directories worth reproducing, and
+    # keeping the build's shape identical to the store Phase 7 introduces means
+    # one scanner rule instead of two.
+    #
+    # The category is *not* lost: it stays in package.lua, which is what the
+    # panel groups by, so the shipped tree agrees with what the editor says
+    # about the same package without the directory having to say it again.
     for package in plugins:
-        # The category it declares decides the directory, not the one it sits in
-        # here. The two usually agree and sometimes do not: a package under
-        # packages/editing/ may declare `core`, and the panel groups it there, so
-        # the build has to put it there too or the shipped tree disagrees with
-        # what the editor says about the same package.
-        leaf = package["rel"].rsplit("/", 1)[-1]
-        dst = out / CATALOG_DIR / package["category"] / leaf
+        leaf = package["name"] + (".lua" if package["single_file"] else "")
+        dst = out / PACKAGES_DIR / leaf
         if package["root"].is_dir():
             copy_tree(package["root"], dst)
         else:
             copy_file(package["root"], dst)
 
     # A standalone theme entry is the exception: the host reads
-    # <data>/themes/<name>/theme.lua, so it lands outside X/ with the rest of the
-    # theme roots.
+    # <data>/themes/<name>/theme.lua, so it lands with the theme roots rather
+    # than with the packages. By name rather than by where it sat here, because
+    # the host's layout is fixed and this repository's is not.
     for package in themes:
-        copy_tree(package["root"], out / package["rel"])
+        copy_tree(package["root"], out / THEME_DIR / package["name"])
 
     # A theme *package* is the harder case, and the reason is fixed rather than
     # ours: the host's theme root is <data>/themes, it is in cdin's extension
@@ -644,8 +799,10 @@ def write_bundle(root: Path, out: Path, bundle_name: str) -> int:
                 dst.mkdir(parents=True, exist_ok=True)
                 copy_file(manifest, dst / "theme.lua")
 
-    for package in plugins:
-        write_shim(out / "plugins" / (package["name"] + ".lua"), package["module"])
+    # Deliberately no per-package shim. A shim in <data>/plugins is an entry the
+    # host loads unconditionally and the user cannot remove, so writing one per
+    # package would put `vim` back exactly where it was before the kernel owned
+    # the shipped set. `KERNEL_SHIM` above is the only entry that directory gets.
 
     # <support>/** — verbatim, at the top level, so a package's own module
     # namespace is the same in a build as in a checkout.
@@ -672,11 +829,29 @@ def write_bundle(root: Path, out: Path, bundle_name: str) -> int:
     return 0
 
 
+def run_selection(root: Path, files: Sequence[str], ignore: Sequence[str]) -> int:
+    """Print the files `select_files` would install from `root`, one per line.
+
+    Exists so validate.lua can run the Python twin of the selection over a package
+    and compare it with the Lua one. Without it the two implementations could drift
+    and the only place that would show is a user's install.
+    """
+    selected, err = select_files(root, files, ignore)
+    if err:
+        die(err)
+    for rel in selected:
+        print(rel)
+    return 0
+
+
 def main() -> int:
     default_root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(
         description="Bundle a named set of cdin-x packages for a cdin build.")
-    parser.add_argument("--out", required=True, type=Path,
+    # Not required here, because --select is a second mode that writes stdout
+    # instead of a directory. The check that one of the two is present is in main(),
+    # where the reason can be given rather than argparse's generic "required".
+    parser.add_argument("--out", type=Path,
                         help="destination data/ directory")
     parser.add_argument("--bundle", default=None,
                         help="bundle to take the packages from "
@@ -684,9 +859,31 @@ def main() -> int:
                              "that wants nothing names `empty`" % DEFAULT_BUNDLE)
     parser.add_argument("--cdinx-root", type=Path, default=default_root,
                         help="cdin-x checkout (default: this repository)")
+    parser.add_argument("--select", type=Path, default=None, metavar="PKG_DIR",
+                        help="print the files the selection would install from "
+                             "PKG_DIR, one per line, and exit")
+    parser.add_argument("--files", default=None,
+                        help="the package's `files` list, comma-separated "
+                             "(default: the built-in default)")
+    parser.add_argument("--ignore", default=None,
+                        help="the package's `ignore` list, comma-separated "
+                             "(default: the built-in default)")
     args = parser.parse_args()
 
+    if args.select is None and args.out is None:
+        die("one of --out <dir> (write a bundle) or --select <pkg> (print a "
+            "selection) is required")
+
     root = args.cdinx_root
+
+    if args.select is not None:
+        # A separate mode rather than a flag on the bundler, because the bundler
+        # writes a directory and this writes stdout: a caller that asked for one
+        # and got the other has a build to clean up.
+        files = args.files.split(",") if args.files else None
+        ignore = args.ignore.split(",") if args.ignore else None
+        return run_selection(args.select, files, ignore)
+
     out = args.out
 
     # The destination has to be a real directory. A symlink or junction left

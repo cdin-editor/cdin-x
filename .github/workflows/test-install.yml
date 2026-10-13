@@ -50,20 +50,25 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/install.py
-          for f in cdinx/init.lua X/manifest.lua plugins/cdin-x/init.lua \
-                   packages/system/themes/package.lua; do
+          for f in cdinx/init.lua plugins/cdin-x/init.lua \
+                   packages/system/themes/package.lua \
+                   packages/languages/python/package.lua; do
             if [ ! -e "$CDIN_SITE_DIR/$f" ]; then
               echo "::error::install did not place $f"
               exit 1
             fi
           done
-          echo "✓ copy mode placed all four directories"
+          echo "✓ copy mode placed all three directories"
 
-      # The four directories, and nothing else. `packages/` was optional during
-      # the move out of X/ and is required now -- themes are a package, vim is the
-      # last entry in X/ -- so a site install is one install again. An install that
-      # also drops a manifest or a README next to them is a layout cdin does not
-      # know how to read, and it would be found here rather than by a user.
+      # The three directories, and nothing else. There were four until Phase 9
+      # removed `X/`, and before that `packages/` was optional -- a site install is
+      # one install now, and an install that also drops a manifest or a README next
+      # to them is a layout cdin does not know how to read, so it would be found
+      # here rather than by a user.
+      #
+      # `packages/languages/` is in the list on purpose: it is the newest root under
+      # `packages/`, and an install that reached the older packages and stopped would
+      # pass every check above and give an editor with no highlighting.
       - name: Install writes nothing else
         shell: bash
         env:
@@ -71,9 +76,9 @@ jobs:
         run: |
           set -euo pipefail
           actual=$(cd "$CDIN_SITE_DIR" && ls -1 | sort | tr '\n' ' ')
-          if [ "$actual" != "X cdinx packages plugins " ]; then
+          if [ "$actual" != "cdinx packages plugins " ]; then
             echo "::error::site directory contains: $actual"
-            echo "expected exactly: X cdinx packages plugins"
+            echo "expected exactly: cdinx packages plugins"
             exit 1
           fi
 
@@ -93,9 +98,8 @@ jobs:
         run: |
           set -euo pipefail
           python scripts/install.py --uninstall
-          if [ -e "$CDIN_SITE_DIR/cdinx" ] || [ -e "$CDIN_SITE_DIR/X" ] \
-             || [ -e "$CDIN_SITE_DIR/packages" ]; then
-            echo "::error::uninstall left cdinx/, X/ or packages/ behind"
+          if [ -e "$CDIN_SITE_DIR/cdinx" ] || [ -e "$CDIN_SITE_DIR/packages" ]; then
+            echo "::error::uninstall left cdinx/ or packages/ behind"
             exit 1
           fi
           echo "✓ uninstall removed everything it installed"
@@ -112,11 +116,11 @@ jobs:
           # checkout changes what cdin loads, and a fallback to copy would
           # silently turn development into a stale install.
           #
-          # Checked for all three roots, not just cdinx. A symlink install that
-          # linked two of them and copied the third would be a development setup
-          # where some edits take effect and some do not -- which reads as the
-          # editor having cached something.
-          for d in cdinx X packages; do
+          # Checked for every root, not just cdinx. A symlink install that linked
+          # two of them and copied the third would be a development setup where
+          # some edits take effect and some do not -- which reads as the editor
+          # having cached something.
+          for d in cdinx packages plugins; do
             if [ ! -L "$CDIN_SITE_DIR/$d" ]; then
               echo "::error::--symlink did not create a link at $d/"
               ls -la "$CDIN_SITE_DIR"
@@ -128,7 +132,7 @@ jobs:
             echo "::error::uninstall followed the link instead of unlinking it"
             exit 1
           fi
-          echo "✓ symlink mode links all three roots, and uninstall unlinks rather than deletes the target"
+          echo "✓ symlink mode links every root, and uninstall unlinks rather than deletes the target"
 
       # The site directory name is the one value duplicated between the two
       # repositories. cdin owns it; this script mirrors it. They cannot

@@ -7,7 +7,7 @@
 <!-- put an x in the boxes that apply -->
 
 - [ ] Bug fix
-- [ ] New plugin (added to X/)
+- [ ] New package (added to `packages/<domain>/<name>/` with a `package.lua`)
 - [ ] New feature (plugin manager, command, etc.)
 - [ ] Breaking change
 - [ ] Documentation update

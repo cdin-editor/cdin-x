@@ -11,16 +11,17 @@ local M = {}
 
 local SEP = package.config:sub(1, 1)
 
---- The roots a first-party package may live under, newest first. A package is
---- found under whichever has it, so the two do not have to agree on anything.
-M.CATALOG_ROOTS = { "packages", "X" }
+--- The roots a first-party package may live under. One since Phase 9 removed `X/`.
+--- Kept as a list rather than a string because every caller walks it, and a
+--- collection that changes shape when a second root is added is a collection every
+--- caller has to be re-read after.
+M.CATALOG_ROOTS = { "packages" }
 
---- Where themes live, in preference order. A theme is
---- `<root>/<name>/theme.lua`, which is the host's fixed layout, so the only thing
---- that varies is the parent: `X/themes/` before the themes package existed,
---- `packages/system/themes/themes/` now that it holds them. The package itself is
+--- Where themes live. A theme is `<root>/<name>/theme.lua`, which is the host's
+--- fixed layout, so the only thing that varies is the parent. One parent since
+--- Phase 9: `X/themes/` went with the rest of `X/`. The themes package itself is
 --- one catalog entry and is not descended into, so its themes are found here.
-M.THEME_ROOTS = { "packages/system/themes/themes", "X/themes" }
+M.THEME_ROOTS = { "packages/system/themes/themes" }
 
 local function shell_quote(path)
   if SEP == "\\" then
@@ -212,10 +213,12 @@ function M.list_dir(path)
     -- The parser below reads a "KIND name" pair, and only the PowerShell
     -- branch used to emit one. `ls -A` prints bare names, so every line failed
     -- the pattern and list_dir returned {} -- on every POSIX system. Nothing
-    -- looked broken: `make manifest` reported "0 extensions" and wrote a
-    -- 29-line X/manifest.lua over the 573-line catalog index, and
-    -- CONTRIBUTING.md tells contributors to run exactly that and commit the
-    -- result.
+    -- looked broken: the generators reported "0 extensions" and wrote a stub
+    -- index over a real one, and CONTRIBUTING.md tells contributors to run
+    -- exactly that and commit the result. `make index` is the one that
+    -- survived; `make manifest` and `X/manifest.lua` went in Phase 9, and this
+    -- bug is why the surviving one now writes the file only after it knows how
+    -- many entries it found.
     --
     -- Two `find` passes, one per kind, each prefixed, because `find -printf` is
     -- GNU-only and this has to work on macOS too. `-mindepth`/`-maxdepth` are
@@ -271,12 +274,16 @@ end
 -- theme registry uses (<root>/<name>/theme.lua), so a theme can be handed
 -- straight to core.themes.add_root() without being copied or renamed.
 --
--- THEME_ROOTS is a list because themes have two homes: `X/themes/` where they
--- were before the themes package existed, and `themes/themes/` inside the
--- themes package, where they are now. Both are scanned, so a tree can have its
--- themes in either place and the answer is the same. The package itself is not
--- descended into by the catalog scan -- it has a package.lua, so it is one
--- package -- which is why its themes are found here rather than there.
+-- THEME_ROOTS is a list because the *host's* theme layout is fixed but this
+-- repository's is not, and a rule that hard-coded one path would break the moment
+-- a second home appeared. There was a second: `X/themes/`, before the themes
+-- package existed. Phase 9 removed it with the rest of `X/`, so the list has one
+-- entry again -- and it stays a list, because the alternative is a string that has
+-- to change again the next time.
+--
+-- The themes package itself is not descended into by the catalog scan -- it has a
+-- package.lua, so it is one package -- which is why its themes are found here
+-- rather than there.
 function M.theme_entries()
   local entries = {}
   for _, themes_dir in ipairs(M.THEME_ROOTS) do

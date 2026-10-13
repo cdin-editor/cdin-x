@@ -92,16 +92,33 @@ jobs:
       # Belt and braces, and cheap: validate.lua already asserts this set, but
       # it does so from Lua, and a release tag should not depend on one
       # interpreter's idea of what a path separator is.
+      #
+      # `packages/vim/`, not `plugins/vim.lua`: a build ships its packages under
+      # packages/ for the kernel to load, and `plugins/` holds only the kernel's own
+      # shim. The loop also asserts that plugins/vim.lua is *absent*, because its
+      # presence would mean the host -- not the kernel -- was loading vim, which
+      # would make it impossible to turn off.
+      #
+      # `X/` is asserted absent too. Since Phase 9 that is not a "must not" the
+      # bundler has to be careful about -- nothing writes it, and RETIRED_DIRS clears
+      # it out of a build made before the move -- so the assertion catches the
+      # bundler growing a second catalog root back.
       - name: Assert the standard bundle is present
         run: |
           cd "$RUNNER_TEMP/bundle-1"
           missing=0
-          for f in BUNDLE.lua plugins/cdin-x.lua plugins/manager.lua plugins/vim.lua \
-                   themes/default/theme.lua X/core/vim/init.lua X/core/vim/registry.lua \
-                   X/core/vim/ex/init.lua fonts/font.ttf \
+          for f in BUNDLE.lua plugins/cdin-x.lua \
+                   themes/default/theme.lua packages/vim/init.lua packages/vim/registry.lua \
+                   packages/vim/ex/init.lua fonts/font.ttf \
                    fonts/monospace.ttf fonts/icons.ttf; do
             if [ ! -f "$f" ]; then
               echo "::error::bundle is missing $f"
+              missing=1
+            fi
+          done
+          for f in plugins/vim.lua plugins/themes.lua X X/core/vim X/manifest.lua; do
+            if [ -e "$f" ]; then
+              echo "::error::bundle carries $f, which it must not: the host loads everything in plugins/ unconditionally"
               missing=1
             fi
           done
