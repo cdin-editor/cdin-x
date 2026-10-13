@@ -23,6 +23,8 @@
 -- The contract is a feature's contract: `enable()` registers, `disable()` undoes it
 -- with the same table. Not checkable from here, so the shape is checked instead
 -- (check.lua R8) and the symmetry is what `disable_all` relies on.
+local Seam = require "cdinx.manager.seam"
+
 local With = {}
 
 --- @class WithSpec
@@ -154,23 +156,15 @@ function With.enable(ctx, name, entry)
   local module_name, name_err = module_name_of(name, entry.path)
   if not module_name then return nil, name_err end
 
-  local ok, mod = pcall(require, module_name)
-  if not ok then
-    return nil, string.format("%s: with %q did not load: %s",
-      name, entry.other, tostring(mod))
-  end
-  if type(mod) ~= "table" then
-    return nil, string.format("%s: %s must return a table, got %s",
-      name, entry.path, type(mod))
-  end
-  if type(mod.enable) ~= "function" then
-    return nil, string.format("%s: %s has no enable()", name, entry.path)
-  end
-
-  local enabled, enable_err = pcall(mod.enable)
-  if not enabled then
-    return nil, string.format("%s: with %q failed to enable: %s",
-      name, entry.other, tostring(enable_err))
+  -- The load/validate/forget half of the lifecycle belongs to seam.lua, and it is
+  -- the half that drifted: this file has always cleared the cached module when
+  -- enable() raises, and features.lua did not. What stays here is what is this
+  -- module's business: turning a path into a module name, the record written on
+  -- success, and the fact that a with entry is called with no argument at all.
+  local mod, raise_err =
+    Seam.raise(module_name, { pkg = name, kind = "with", name = entry.other, file = entry.path })
+  if not mod then
+    return nil, raise_err
   end
 
   ctx.active_with[name][entry.path] = { mod = mod, other = entry.other }

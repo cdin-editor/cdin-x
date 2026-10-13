@@ -17,6 +17,7 @@
 -- checked instead (check.lua R8) and the symmetry is what `disable_all` relies
 -- on.
 local Host = require "cdinx.host"
+local Seam = require "cdinx.manager.seam"
 
 local Features = {}
 
@@ -158,23 +159,18 @@ function Features.enable(ctx, name, key, opts)
   end
 
   local module_name = name .. ".features." .. key
-  local ok, mod = pcall(require, module_name)
-  if not ok then
-    return nil, string.format("%s: feature %q did not load: %s", name, key, tostring(mod))
-  end
-  if type(mod) ~= "table" then
-    return nil, string.format("%s: features/%s.lua must return a table, got %s",
-      name, key, type(mod))
-  end
-  if type(mod.enable) ~= "function" then
-    return nil, string.format("%s: features/%s.lua has no enable()", name, key)
-  end
-
-  -- `enable` takes the options so a feature that has them reads one place. It
-  -- ignores the argument if it has none, which is most features.
-  local enabled, err = pcall(mod.enable, opts)
-  if not enabled then
-    return nil, string.format("%s: feature %q failed to enable: %s", name, key, tostring(err))
+  -- The load/validate/forget half of the lifecycle belongs to seam.lua, so that
+  -- it cannot drift from with.lua's copy of it again. What stays here is the
+  -- part that is this module's business: the module name, the record key, and
+  -- the fact that a feature is always passed the options, even a nil one.
+  local mod, raise_err = Seam.raise(
+    module_name,
+    { pkg = name, kind = "feature", name = key, file = "features/" .. key .. ".lua" },
+    opts,
+    true
+  )
+  if not mod then
+    return nil, raise_err
   end
 
   ctx.active_features[name][key] = mod
