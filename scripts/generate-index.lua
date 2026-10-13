@@ -94,6 +94,20 @@ end
 lines[#lines + 1] = "  },"
 lines[#lines + 1] = "}"
 
+-- An empty index is never what was meant, and writing one destroys the file that
+-- was. This has happened: a scanner that found nothing on a POSIX box replaced a
+-- real catalog with a stub, and nothing complained because the stub parses.
+--
+-- Refused rather than written, and the committed file is left exactly as it was,
+-- because the recovery for a generator that has just done that is `git checkout`,
+-- and the recovery for a generator that refuses is this message.
+if #names == 0 then
+  error(string.format(
+    "%s: found no packages under any catalog root, so nothing was written. "
+    .. "An empty index would replace a good one. Check that packages/ exists "
+    .. "and that scripts/_scan.lua can list it.", OUT))
+end
+
 local fp, ferr = io.open(OUT, "wb")
 if not fp then error(ferr) end
 fp:write(table.concat(lines, "\n"), "\n")

@@ -158,19 +158,35 @@ custom:
     - path: "/bundles/minimal.lua"
     - path: "/bundles/empty.lua"
 
-    # X/ — the last entry, and the syntax definitions
-    - path: "/X/core/vim/package.lua"
-    - path: "/X/core/vim/init.lua"
-    - path: "/X/syntax/lua.lua"
-
-    # The generated catalog index. Written by `make manifest`; do not edit.
-    - path: "/X/manifest.lua"
-
     # packages/ — one manifest each, which is what makes a package a package.
+    # `X/` was in this list until Phase 9 and no longer is; `registry/generated/`
+    # was never here, because the index is generated and a packaging list that
+    # names it is a packaging list that can be stale.
     - path: "/packages/navigation/workspace/package.lua"
     - path: "/packages/navigation/launcher/package.lua"
     - path: "/packages/system/themes/package.lua"
     - path: "/packages/vcs/git/package.lua"
+
+    # packages/languages/ — a package like any other, with the definition in its
+    # own file so `init.lua` is the same three lines in all six.
+    - path: "/packages/languages/c/package.lua"
+    - path: "/packages/languages/c/syntax.lua"
+    - path: "/packages/languages/c/init.lua"
+    - path: "/packages/languages/javascript/package.lua"
+    - path: "/packages/languages/javascript/syntax.lua"
+    - path: "/packages/languages/javascript/init.lua"
+    - path: "/packages/languages/lua/package.lua"
+    - path: "/packages/languages/lua/syntax.lua"
+    - path: "/packages/languages/lua/init.lua"
+    - path: "/packages/languages/markdown/package.lua"
+    - path: "/packages/languages/markdown/syntax.lua"
+    - path: "/packages/languages/markdown/init.lua"
+    - path: "/packages/languages/python/package.lua"
+    - path: "/packages/languages/python/syntax.lua"
+    - path: "/packages/languages/python/init.lua"
+    - path: "/packages/languages/typescript/package.lua"
+    - path: "/packages/languages/typescript/syntax.lua"
+    - path: "/packages/languages/typescript/init.lua"
 
     # Examples
     - path: "/examples/01-hello/init.lua"
