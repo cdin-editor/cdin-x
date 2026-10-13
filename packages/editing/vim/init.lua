@@ -89,8 +89,12 @@ function M.init(core, config)
   -- `vim.main` last, and before any feature or with-entry can extend it.
   local ok, registry = pcall(require, "menu.impl")
   if ok and type(registry) == "table" then
+    -- The registry is handed to register() rather than required inside
+    -- with/menus/menu.lua, because that file has to stay requireable without the
+    -- menu package -- it is what the menu exists for. So the one place that
+    -- certainly has the registry is the one that passes it.
     menus_menu = require "vim.with.menus.menu"
-    menus_menu.register()
+    menus_menu.register(registry)
   end
 
   loaded = {

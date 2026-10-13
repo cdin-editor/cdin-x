@@ -114,6 +114,13 @@ function M.register(menu)
   menu.define(M.NAME, { title = "Menu", context = context, entries = entries })
 end
 
+--- Removes the menu definition.
+---
+--- There is nothing to do, and that is a property of `menu.impl` rather than an
+--- oversight: it has `remove_extension` and `remove_context_provider` but no
+--- counterpart to `define`, because every extender of `vim.main` is torn down
+--- before this runs and a definition with no extenders is inert. Removing it
+--- would need a new seam in the menu package for a case that cannot arise.
 function M.unregister() end
 
 return M
