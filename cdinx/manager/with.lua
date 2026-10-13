@@ -217,8 +217,16 @@ function With.disable_all(ctx, name)
 
   local order = {}
   for path in pairs(entry) do order[#order + 1] = path end
+  -- `_order` is written by `apply` onto the module, and what `enable` puts in
+  -- this table is a record around that module -- so it is read through the
+  -- record's `mod`. Reading `entry[a]._order` finds nil on every entry, the
+  -- comparator is never true, and `table.sort` returns whatever order `pairs`
+  -- produced: not the reverse of the order these went up in, and not the same
+  -- twice. Every stored record came from a successful `enable` (the only caller
+  -- of which is `apply`, which stamps `_order`), and `disable` below already
+  -- treats `rec.mod` as a table, so reading through it adds no new assumption.
   table.sort(order, function(a, b)
-    return (entry[a]._order or 0) > (entry[b]._order or 0)
+    return (entry[a].mod._order or 0) > (entry[b].mod._order or 0)
   end)
 
   for _, path in ipairs(order) do
