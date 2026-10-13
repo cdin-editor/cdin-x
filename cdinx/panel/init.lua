@@ -57,7 +57,7 @@ local function feature_rows(name, plugin)
 
   local overrides = Packages.feature_overrides(name) or {}
   local active = {}
-  for _, key in ipairs(Features.active(ctx, name)) do active[key] = true end
+  for _, key in ipairs(Features.active(ctx(), name)) do active[key] = true end
 
   for _, f in ipairs(declared) do
     -- The effective state, not the declared default: an override is what counts,
