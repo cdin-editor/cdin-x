@@ -1,0 +1,87 @@
+# The third-party index, and what may go in it.
+#
+# `registry/index.lua` is the only file in this repository that names a repository
+# somebody else wrote, and the only one a user can be made to install from by
+# something other than their own `packages.lua`. So it is the one file here that
+# needs a gate of its own rather than a rule inside `make validate`.
+#
+#   recipe     every entry names a commit, and the commit is the one its tag
+#              resolves to                              (scripts/pin-recipe.lua)
+#   naming     every entry keeps the name rules, its URL alphabet, and the rule
+#              that a recipe may not claim a name this tree already owns
+#                                                           (make validate)
+#
+# The split matters. `validate` runs with no network and must stay that way: it is
+# the gate a build runs, and a gate that needs the internet is a gate that fails
+# when the internet does. Resolving a tag is the opposite -- it is *only* meaningful
+# with the network, and its failure is information ("that tag does not exist", "that
+# commit is the tag object, not the commit") rather than an outage.
+#
+# What this file deliberately does NOT do: review the code in a third-party
+# repository, or decide whether a package is good. It checks that the index says
+# what it means, and that it cannot move under a user after it lands. Whether a
+# package belongs in the index is the owner's decision.
+
+name: Check
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'registry/**'
+      - 'scripts/pin-recipe.lua'
+      - 'cdinx/manager/recipe.lua'
+      - 'scripts/validate.lua'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'registry/**'
+      - 'scripts/pin-recipe.lua'
+      - 'cdinx/manager/recipe.lua'
+      - 'scripts/validate.lua'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  recipe:
+    name: Every recipe is pinned to the commit its tag names
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Lua 5.4
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends lua5.4
+          command -v lua >/dev/null 2>&1 || \
+            sudo ln -sf "$(command -v lua5.4)" /usr/local/bin/lua
+          lua -v
+
+      # `git ls-remote` against somebody else's repository, so this job is the one
+      # that fails when the network does. There is no way around that and no way to
+      # make it lie: a gate that reported "fine" without asking would be worse than
+      # no gate, because the pin is the only thing standing between a moved tag and
+      # a user who installed a different package than the one they reviewed.
+      #
+      # The comment above each command matters here. `git ls-remote` writes
+      # '***' lines for a tag it cannot reach, and a workflow that reads those as
+      # "no discrepancy" would pass a broken index -- so the script's exit code is
+      # the verdict, not its output.
+      - name: Resolve every recipe
+        run: lua scripts/pin-recipe.lua
+
+      # The resolution is printed on success too, so the log is the record of what
+      # each recipe pointed at when this build ran. A reader comparing two runs can
+      # see a tag move without reading a diff.
+      - name: Name the commits in the summary
+        if: always()
+        run: lua scripts/pin-recipe.lua || true

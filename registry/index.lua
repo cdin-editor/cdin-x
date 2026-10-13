@@ -1,0 +1,26 @@
+-- Third-party package recipes, in the MELPA sense: each entry points at its
+-- author's repository, and installing one clones from there -- never from this
+-- repository. A recipe is accepted by CI, which resolves the tag to a commit SHA
+-- before it lands here, so every `rev` below is a full commit and `ref` is the
+-- human tag it was resolved from.
+--
+-- An entry:
+--
+--   {
+--     name = "cdin-elixir",       -- what `packages.lua` and the panel name
+--     git = "https://github.com/someone/cdin-elixir.git",
+--     rev = "0123456789abcdef...", -- 40 hex, the commit CI resolved
+--     ref = "v1.2.0",             -- the tag it was resolved from (optional)
+--     subdir = "lang/elixir",     -- for monorepos; the package root (optional)
+--     kind = "plugin",            -- plugin | lang | theme | glue
+--     description = "Elixir support",
+--   }
+--
+-- Rules, enforced by `scripts/validate.lua` and by the reader in
+-- `cdinx/manager/registry.lua`: the name is a valid package name and not a
+-- first-party one; the URL is https://, ssh:// or git@host:path; `rev` is a
+-- commit, never a tag or a branch; `subdir`, when present, stays inside the
+-- repository. A repository whose root has no `package.lua` is found to depth 3,
+-- or listed explicitly in its own `cdin-x.lua`.
+return {
+}
