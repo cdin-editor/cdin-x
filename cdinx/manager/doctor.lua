@@ -86,7 +86,8 @@ end
 function Doctor.git()
   local exe, why = Git.find()
   if not exe then return check("git", BAD, tostring(why),
-    "install Git for Windows, or put git on PATH") end
+    "install Git for your operating system, or add its executable directory to PATH "
+      .. "and restart CDIN") end
   local version = Git.version()
   local sparse = Git.supports_sparse()
   return check("git", OK, string.format("%s (%s%s)", tostring(exe), tostring(version),

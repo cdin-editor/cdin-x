@@ -155,58 +155,154 @@ end
 
 -- ── the executable ───────────────────────────────────────────────────────
 
---- Where git is, or nil.
----
---- Probed once and cached, because a missing git is a fact about the machine and
---- asking again on every install would cost a process spawn to learn nothing new.
----
---- PATH is tried first because that is where a user who installed git put it; the
---- Git for Windows locations after, because that installer does not always add
---- itself to PATH for a process that is not an interactive shell.
----
---- The probe is `--version` rather than `rev-parse`: it starts no repository
---- discovery, touches no network, and says the one thing we want to know.
---- @return string|nil path
+local function file_exists(path)
+  local file = io.open(path, "rb")
+  if not file then return false end
+  file:close()
+  return true
+end
+
+local function capture_output(command)
+  local process = Host.system
+  if type(process) == "table" and type(process.popen) == "function" then
+    local ok, result = pcall(process.popen, command)
+    if ok then
+      if type(result) == "string" and result ~= "" then return result end
+      local kind = type(result)
+      if kind == "table" or kind == "userdata" then
+        local read_ok, output = pcall(function() return result:read("*a") end)
+        pcall(function() result:close() end)
+        if read_ok and type(output) == "string" and output ~= "" then
+          return output
+        end
+      end
+    end
+  end
+
+  if type(io.popen) ~= "function" then return nil end
+  local null = Host.is_windows and " 2>NUL" or " 2>/dev/null"
+  local ok, pipe = pcall(io.popen, command .. null, "r")
+  if not ok or not pipe then return nil end
+  local read_ok, output = pcall(function() return pipe:read("*a") end)
+  pcall(function() pipe:close() end)
+  if not read_ok or type(output) ~= "string" then return nil end
+  return output
+end
+
+local function git_candidates()
+  local candidates, seen = {}, {}
+  local function add(path)
+    if type(path) ~= "string" then return end
+    path = path:gsub("^%s+", ""):gsub("%s+$", "")
+    if path:sub(1, 1) == '"' and path:sub(-1) == '"' then
+      path = path:sub(2, -2)
+    end
+    if path == "" then return end
+    local key = Host.is_windows and path:lower() or path
+    if seen[key] then return end
+    seen[key] = true
+    candidates[#candidates + 1] = path
+  end
+
+  local path = os.getenv("PATH") or ""
+  local separator = Host.is_windows and ";" or ":"
+  for entry in (path .. separator):gmatch("(.-)" .. separator) do
+    local directory = entry
+    directory = directory:gsub("^%s+", ""):gsub("%s+$", "")
+    if directory:sub(1, 1) == '"' and directory:sub(-1) == '"' then
+      directory = directory:sub(2, -2)
+    end
+    if directory ~= "" and directory ~= "." then
+      if Host.is_windows then
+        add(Util.join(directory, "git.exe"))
+      else
+        add(Util.join(directory, "git"))
+      end
+    end
+  end
+
+  if Host.is_windows then
+    local program_files = os.getenv("ProgramFiles") or "C:/Program Files"
+    local program_files_x86 = os.getenv("ProgramFiles(x86)") or "C:/Program Files (x86)"
+    for _, base in ipairs({ program_files, program_files_x86 }) do
+      add(Util.join(base, "Git", "cmd", "git.exe"))
+      add(Util.join(base, "Git", "bin", "git.exe"))
+      add(Util.join(base, "Git", "mingw64", "bin", "git.exe"))
+    end
+    local local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data then
+      add(Util.join(local_app_data, "Programs", "Git", "cmd", "git.exe"))
+      add(Util.join(local_app_data, "Programs", "Git", "bin", "git.exe"))
+    end
+    local home = os.getenv("USERPROFILE")
+    if home then
+      add(Util.join(home, "scoop", "apps", "git", "current", "cmd", "git.exe"))
+      add(Util.join(home, "scoop", "apps", "git", "current", "bin", "git.exe"))
+    end
+    local chocolatey = os.getenv("ChocolateyInstall") or "C:/ProgramData/chocolatey"
+    add(Util.join(chocolatey, "bin", "git.exe"))
+    add("C:/msys64/usr/bin/git.exe")
+    add("C:/msys64/mingw64/bin/git.exe")
+  else
+    add("/usr/bin/git")
+    add("/bin/git")
+    add("/usr/local/bin/git")
+    add("/usr/local/git/bin/git")
+    add("/opt/homebrew/bin/git")
+    add("/opt/local/bin/git")
+    add("/nix/var/nix/profiles/default/bin/git")
+    local home = os.getenv("HOME")
+    if home then
+      add(Util.join(home, ".local", "bin", "git"))
+      add(Util.join(home, "bin", "git"))
+      add(Util.join(home, ".nix-profile", "bin", "git"))
+      add(Util.join(home, ".linuxbrew", "bin", "git"))
+    end
+    add("/home/linuxbrew/.linuxbrew/bin/git")
+  end
+
+  return candidates
+end
+
+local function probe(exe)
+  local output = capture_output(Git.argv_to_command({ exe, "--version" }))
+  if type(output) == "string" then
+    local version = output:match("git version ([%d%.]+)")
+    if version then return exe, version end
+    if output ~= "" then return nil, nil, output:sub(1, 200) end
+  end
+  return nil, nil, "git --version produced no output"
+end
+
+--- Finds Git and caches a successful path for later commands.
+--- @return string|false path
 --- @return string|nil why
 function Git.find()
   if Git._found ~= nil then
     return Git._found, Git._why
   end
 
-  local function probe(exe)
-    local cmd = Git.argv_to_command({ exe, "--version" })
-    local pipe = io.popen(cmd .. " 2>nul")
-    local out = pipe and pipe:read("*a") or ""
-    if pipe then pipe:close() end
-    if type(out) == "string" and out:find("git version", 1, true) then
-      return exe, out:match("git version ([%d%.]+)")
-    end
-    return nil
-  end
-
-  for _, exe in ipairs({ "git", "git.exe" }) do
-    local found, version = probe(exe)
-    if found then
-      Git._found, Git._why, Git._version = found, nil, version
-      return found
+  local checked, last_error = 0, nil
+  for _, candidate in ipairs(git_candidates()) do
+    if file_exists(candidate) then
+      checked = checked + 1
+      local found, version, why = probe(candidate)
+      if found then
+        Git._found, Git._why, Git._version = found, nil, version
+        return found
+      end
+      last_error = candidate .. ": " .. tostring(why)
     end
   end
 
-  -- The usual install locations, tried in the order a user would expect: 64-bit
-  -- first, then 32-bit.
-  local suffix = Util.join("Programs", "Git", "cmd", "git.exe")
-  for _, base in ipairs({ "C:/Program Files", "C:/Program Files (x86)" }) do
-    local candidate = base .. "/" .. suffix
-    local found, version = probe(candidate)
-    if found then
-      Git._found, Git._why, Git._version = found, nil, version
-      return found
-    end
+  Git._found, Git._version = nil, nil
+  if checked > 0 then
+    Git._why = "Git executable(s) were found, but none passed `git --version`. "
+      .. tostring(last_error)
+  else
+    Git._why = "Git was not found in PATH or common installation locations. "
+      .. "Install Git or add its executable directory to PATH, then restart CDIN."
   end
-
-  Git._found, Git._why = false, [[git was not found on PATH or in the usual
-    locations. Packages shipped with the editor need no git; installing or
-    updating one does. Install Git for Windows, or put git on PATH, and try again.]]
   return false, Git._why
 end
 
@@ -236,7 +332,7 @@ end
 
 --- Forgets the probe, so a test can ask again.
 function Git.reset_probe()
-  Git._found, Git._why = nil, nil
+  Git._found, Git._why, Git._version = nil, nil, nil
 end
 
 -- ── argument builders ────────────────────────────────────────────────────
@@ -541,6 +637,24 @@ end
 
 -- ── running them ─────────────────────────────────────────────────────────
 
+--- The argv with a leading `git` replaced by the executable `Git.find` located.
+--- Any other argv is passed through untouched.
+--- @param argv string[]
+--- @return string[]|nil resolved
+--- @return string|nil why
+local function resolved_argv(argv)
+  if type(argv) ~= "table" or type(argv[1]) ~= "string" then
+    return nil, "invalid git argument list"
+  end
+  if argv[1] ~= "git" then return argv end
+  local exe, why = Git.find()
+  if not exe then return nil, why end
+  local resolved = {}
+  for i, arg in ipairs(argv) do resolved[i] = arg end
+  resolved[1] = exe
+  return resolved
+end
+
 --- Runs one git command and waits for it.
 ---
 --- Only for the *local* ones. Anything that touches the network goes through
@@ -552,7 +666,9 @@ end
 --- @return string output  stdout and stderr together, trimmed
 --- @return string|nil why
 function Git.run_now(argv, opts)
-  local command = Git.argv_to_command(argv, Git.env())
+  local resolved, err = resolved_argv(argv)
+  if not resolved then return false, "", err end
+  local command = Git.argv_to_command(resolved, Git.env())
   if opts and opts.cwd then
     command = "cd " .. Git.quote(opts.cwd) .. " && " .. command
   end
@@ -581,6 +697,8 @@ end
 --- @return table|nil job
 --- @return string|nil why
 function Git.run(argv, workdir, opts)
+  local resolved, err = resolved_argv(argv)
+  if not resolved then return nil, err end
   opts = opts or {}
   local label = (opts.label or "git"):gsub("[^%w%-]", "_")
   local base = Util.join(workdir, "." .. label)
@@ -595,7 +713,7 @@ function Git.run(argv, workdir, opts)
   Host.fs.rm(done)
   Host.fs.rm(log)
 
-  local command = Git.argv_to_command(argv, Git.env())
+  local command = Git.argv_to_command(resolved, Git.env())
   if opts.cwd then
     command = "cd " .. Git.quote(opts.cwd) .. " && " .. command
   end
