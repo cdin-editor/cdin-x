@@ -9,6 +9,13 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [0.3.0] - 2026-11-10
 
+### Breaking changes
+
+- Remove the manifest-level `essential` flag; bundle definitions now determine the installed package set. Update custom manifests and build scripts to use `bundles/` and the explicit bundle selector.
+- Make `package.lua` the declarative, sandbox-read package identity and use its `name` rather than filesystem location. Consumers must not rely on package paths as import identities or execute package metadata.
+- Rename syntax packages to the required `lang-*` namespace and declare their `kind = "lang"`; update package selections and module imports such as `require "lang-python.syntax"`.
+- Replace implicit package activation assumptions with explicit package features and lifecycle relationships. Review custom package overrides and feature toggles against the new catalog and bundle definitions.
+
 ### Added
 
 - **Packages, and everything optional inside one.** What a build ships is decided by
